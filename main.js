@@ -390,7 +390,8 @@ class Byd extends utils.Adapter {
             return;
         }
 
-        const { outer } = bydapi.buildRemoteControlRequest(
+        // Trigger remote control
+        const triggerReq = bydapi.buildRemoteControlRequest(
             this.session,
             this.config.countryCode,
             this.config.language,
@@ -399,6 +400,8 @@ class Byd extends utils.Adapter {
             instructionCode,
         );
 
+        let requestSerial = null;
+
         await this.requestClient({
             method: 'post',
             url: `${bydapi.BASE_URL}/control/remoteControl`,
@@ -406,21 +409,79 @@ class Byd extends utils.Adapter {
                 'User-Agent': bydapi.USER_AGENT,
                 'Content-Type': 'application/json; charset=UTF-8',
             },
-            data: { request: bydapi.encodeEnvelope(outer) },
+            data: { request: bydapi.encodeEnvelope(triggerReq.outer) },
         })
             .then(async res => {
-                this.log.debug(`Remote control response: ${JSON.stringify(res.data)}`);
+                this.log.debug(`Remote control trigger response: ${JSON.stringify(res.data)}`);
                 const decoded = bydapi.decodeEnvelope(res.data);
                 if (decoded.code !== '0') {
                     this.log.error(`Remote control failed: code=${decoded.code} message=${decoded.message || ''}`);
-                } else {
-                    this.log.info(`Remote control success: ${instructionCode}`);
+                } else if (decoded.respondData) {
+                    const data = bydapi.decryptResponseData(decoded.respondData, triggerReq.contentKey);
+                    requestSerial = data.requestSerial || null;
+                    this.log.debug(`Remote control triggered, requestSerial: ${requestSerial}`);
                 }
             })
             .catch(error => {
                 this.log.error(`Remote control error: ${error.message}`);
                 error.response && this.log.error(JSON.stringify(error.response.data));
             });
+
+        if (!requestSerial) {
+            return;
+        }
+
+        // Poll for result (up to 10 attempts)
+        for (let attempt = 0; attempt < 10; attempt++) {
+            await this.sleep(1500);
+
+            const pollReq = bydapi.buildRemoteControlRequest(
+                this.session,
+                this.config.countryCode,
+                this.config.language,
+                this.deviceConfig,
+                vin,
+                instructionCode,
+                requestSerial,
+            );
+
+            let ready = false;
+
+            await this.requestClient({
+                method: 'post',
+                url: `${bydapi.BASE_URL}/control/remoteControlResult`,
+                headers: {
+                    'User-Agent': bydapi.USER_AGENT,
+                    'Content-Type': 'application/json; charset=UTF-8',
+                },
+                data: { request: bydapi.encodeEnvelope(pollReq.outer) },
+            })
+                .then(async res => {
+                    this.log.debug(`Remote control poll response: ${JSON.stringify(res.data)}`);
+                    const decoded = bydapi.decodeEnvelope(res.data);
+                    if (decoded.code === '0' && decoded.respondData) {
+                        const data = bydapi.decryptResponseData(decoded.respondData, pollReq.contentKey);
+                        this.log.debug(`Remote control result: ${JSON.stringify(data)}`);
+
+                        if (bydapi.isRemoteControlReady(data)) {
+                            const success = data.controlState === '1' || data.controlState === 1;
+                            if (success) {
+                                this.log.info(`Remote control success: ${instructionCode}`);
+                            } else {
+                                this.log.warn(`Remote control completed with state: ${data.controlState}`);
+                            }
+                            ready = true;
+                        }
+                    }
+                })
+                .catch(error => {
+                    this.log.error(`Remote control poll error: ${error.message}`);
+                });
+
+            if (ready) {
+                break;
+            }
+        }
     }
 
     async onStateChange(id, state) {
