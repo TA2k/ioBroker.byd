@@ -214,6 +214,7 @@ class Byd extends utils.Adapter {
 
             await this.pollVehicleRealtime(vin, id);
             await this.pollGpsInfo(vin, id);
+            await this.getEnergyConsumption(vin, id);
         }
     }
 
@@ -383,6 +384,42 @@ class Byd extends utils.Adapter {
                 break;
             }
         }
+    }
+
+    async getEnergyConsumption(vin, id) {
+        if (!this.session) {
+            return;
+        }
+
+        const req = bydapi.buildEnergyConsumptionRequest(
+            this.session,
+            this.config.countryCode,
+            this.config.language,
+            this.deviceConfig,
+            vin,
+        );
+
+        await this.requestClient({
+            method: 'post',
+            url: `${bydapi.BASE_URL}/vehicleInfo/vehicle/getEnergyConsumption`,
+            headers: {
+                'User-Agent': bydapi.USER_AGENT,
+                'Content-Type': 'application/json; charset=UTF-8',
+            },
+            data: { request: bydapi.encodeEnvelope(req.outer) },
+        })
+            .then(async res => {
+                this.log.debug(`Energy consumption response: ${JSON.stringify(res.data)}`);
+                const decoded = bydapi.decodeEnvelope(res.data);
+                if (decoded.code === '0' && decoded.respondData) {
+                    const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
+                    this.log.debug(`Energy consumption data: ${JSON.stringify(data)}`);
+                    this.json2iob.parse(`${id}.energy`, data, { forceIndex: true });
+                }
+            })
+            .catch(error => {
+                this.log.error(`Energy consumption error: ${error.message}`);
+            });
     }
 
     async sendRemoteControl(vin, instructionCode) {
