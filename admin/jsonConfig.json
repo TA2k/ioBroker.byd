@@ -1,0 +1,99 @@
+{
+    "i18n": false,
+    "type": "panel",
+    "items": {
+        "username": {
+            "type": "text",
+            "label": {
+                "en": "Email",
+                "de": "E-Mail",
+                "ru": "Электронная почта",
+                "pt": "E-mail",
+                "nl": "E-mail",
+                "fr": "Email",
+                "it": "Email",
+                "es": "Correo electrónico",
+                "pl": "E-mail",
+                "uk": "Електронна пошта",
+                "zh-cn": "电子邮件"
+            },
+            "newLine": true,
+            "sm": 6
+        },
+        "password": {
+            "type": "password",
+            "label": {
+                "en": "Password",
+                "de": "Passwort",
+                "ru": "Пароль",
+                "pt": "Senha",
+                "nl": "Wachtwoord",
+                "fr": "Mot de passe",
+                "it": "Password",
+                "es": "Contraseña",
+                "pl": "Hasło",
+                "uk": "Пароль",
+                "zh-cn": "密码"
+            },
+            "newLine": true,
+            "repeat": false,
+            "visible": true,
+            "sm": 6
+        },
+        "countryCode": {
+            "type": "text",
+            "label": {
+                "en": "Country Code (e.g. NL, DE)",
+                "de": "Ländercode (z.B. NL, DE)",
+                "ru": "Код страны (напр. NL, DE)",
+                "pt": "Código do país (ex. NL, DE)",
+                "nl": "Landcode (bijv. NL, DE)",
+                "fr": "Code pays (ex. NL, DE)",
+                "it": "Codice paese (es. NL, DE)",
+                "es": "Código de país (ej. NL, DE)",
+                "pl": "Kod kraju (np. NL, DE)",
+                "uk": "Код країни (напр. NL, DE)",
+                "zh-cn": "国家代码（例如 NL, DE）"
+            },
+            "newLine": true,
+            "sm": 3
+        },
+        "language": {
+            "type": "text",
+            "label": {
+                "en": "Language (e.g. en, de)",
+                "de": "Sprache (z.B. en, de)",
+                "ru": "Язык (напр. en, de)",
+                "pt": "Idioma (ex. en, de)",
+                "nl": "Taal (bijv. en, de)",
+                "fr": "Langue (ex. en, de)",
+                "it": "Lingua (es. en, de)",
+                "es": "Idioma (ej. en, de)",
+                "pl": "Język (np. en, de)",
+                "uk": "Мова (напр. en, de)",
+                "zh-cn": "语言（例如 en, de）"
+            },
+            "newLine": true,
+            "sm": 3
+        },
+        "interval": {
+            "type": "number",
+            "label": {
+                "en": "Update interval (seconds)",
+                "de": "Aktualisierungsintervall (Sekunden)",
+                "ru": "Интервал обновления (секунды)",
+                "pt": "Intervalo de atualização (segundos)",
+                "nl": "Update-interval (seconden)",
+                "fr": "Intervalle de mise à jour (secondes)",
+                "it": "Intervallo di aggiornamento (secondi)",
+                "es": "Intervalo de actualización (segundos)",
+                "pl": "Interwał aktualizacji (sekundy)",
+                "uk": "Інтервал оновлення (секунди)",
+                "zh-cn": "更新间隔（秒）"
+            },
+            "newLine": true,
+            "min": 60,
+            "sm": 3
+        }
+    }
+}

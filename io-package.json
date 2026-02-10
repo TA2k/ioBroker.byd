@@ -1,0 +1,111 @@
+{
+    "common": {
+        "name": "byd",
+        "version": "0.0.1",
+        "news": {
+            "0.0.1": {
+                "en": "initial release",
+                "de": "Erstveröffentlichung",
+                "ru": "Начальная версия",
+                "pt": "lançamento inicial",
+                "nl": "Eerste uitgave",
+                "fr": "Première version",
+                "it": "Versione iniziale",
+                "es": "Versión inicial",
+                "pl": "Pierwsze wydanie",
+                "uk": "Початкова версія",
+                "zh-cn": "首次出版"
+            }
+        },
+        "titleLang": {
+            "en": "BYD",
+            "de": "BYD",
+            "ru": "БИД",
+            "pt": "BYD",
+            "nl": "DOORD",
+            "fr": "BYD",
+            "it": "BYD",
+            "es": "BYD",
+            "pl": "BYD",
+            "uk": "BYD",
+            "zh-cn": "比亚迪"
+        },
+        "desc": {
+            "en": "iobroker Adapter for BYD cars",
+            "de": "iobroker Adapter für BYD-Autos",
+            "ru": "Адаптер iobroker для автомобилей BYD",
+            "pt": "Adaptador iobroker para carros BYD",
+            "nl": "iobroker Adapter voor BYD-auto's",
+            "fr": "Adaptateur iobroker pour voitures BYD",
+            "it": "Adattatore iobroker per auto BYD",
+            "es": "Adaptador iobroker para coches BYD",
+            "pl": "iobroker Adapter do samochodów BYD",
+            "uk": "iobroker Адаптер для автомобілів BYD",
+            "zh-cn": "比亚迪汽车iobroker适配器"
+        },
+        "authors": ["TA2k <tombox2020@gmail.com>"],
+        "keywords": ["byd", "car"],
+        "licenseInformation": {
+            "type": "free",
+            "license": "MIT"
+        },
+        "platform": "Javascript/Node.js",
+        "icon": "byd.png",
+        "enabled": true,
+        "extIcon": "https://raw.githubusercontent.com/TA2k/ioBroker.byd/main/admin/byd.png",
+        "readme": "https://github.com/TA2k/ioBroker.byd/blob/main/README.md",
+        "loglevel": "info",
+        "tier": 3,
+        "mode": "daemon",
+        "type": "vehicle",
+        "compact": true,
+        "connectionType": "cloud",
+        "dataSource": "poll",
+        "adminUI": {
+            "config": "json"
+        },
+        "dependencies": [
+            {
+                "js-controller": ">=6.0.11"
+            }
+        ],
+        "globalDependencies": [
+            {
+                "admin": ">=7.0.23"
+            }
+        ]
+    },
+    "native": {
+        "username": "",
+        "password": "",
+        "countryCode": "NL",
+        "language": "en",
+        "interval": 300
+    },
+    "encryptedNative": ["password"],
+    "protectedNative": ["password"],
+    "objects": [],
+    "instanceObjects": [
+        {
+            "_id": "info",
+            "type": "channel",
+            "common": {
+                "name": "Information"
+            },
+            "native": {}
+        },
+        {
+            "_id": "info.connection",
+            "type": "state",
+            "common": {
+                "role": "indicator.connected",
+                "name": "Device or service connected",
+                "type": "boolean",
+                "read": true,
+                "write": false,
+                "def": false
+            },
+            "native": {}
+        }
+    ]
+}
