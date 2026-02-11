@@ -180,8 +180,9 @@ class Byd extends utils.Adapter {
                         { command: 'refresh', name: 'True = Refresh' },
                         { command: 'lock', name: 'True = Lock' },
                         { command: 'unlock', name: 'True = Unlock' },
-                        { command: 'flash', name: 'True = Flash Lights' },
-                        { command: 'horn', name: 'True = Horn' },
+                        { command: 'flash', name: 'True = Flash Lights (no horn)' },
+                        { command: 'findCar', name: 'True = Flash + Horn (find car)' },
+                        { command: 'closeWindows', name: 'True = Close Windows' },
                         { command: 'climate', name: 'True = Start Climate, False = Stop Climate' },
                         { command: 'seatHeat', name: 'True = Start Seat Heating, False = Stop' },
                     ];
@@ -625,8 +626,9 @@ class Byd extends utils.Adapter {
             const commandTypeMap = {
                 lock: 'LOCKDOOR',
                 unlock: 'OPENDOOR',
-                flash: 'FINDCAR',
-                horn: 'FLASHLIGHTNOWHISTLE',
+                flash: 'FLASHLIGHTNOWHISTLE',
+                findCar: 'FINDCAR',
+                closeWindows: 'CLOSEWINDOW',
             };
 
             const commandType = commandTypeMap[command];

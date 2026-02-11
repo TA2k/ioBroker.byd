@@ -10,6 +10,7 @@
   "homepage": "https://github.com/TA2k/ioBroker.byd",
   "license": "MIT",
   "keywords": [
+    "iobroker",
     "byd",
     "car"
   ],
