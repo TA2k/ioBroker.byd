@@ -153,6 +153,7 @@ class Byd extends utils.Adapter {
                 this.log.debug(`Vehicle list: ${JSON.stringify(data)}`);
 
                 const vehicles = data.allCarList || [];
+                this.log.info(`Found ${vehicles.length} vehicle(s)`);
 
                 for (const vehicle of vehicles) {
                     const vin = vehicle.vin;
@@ -163,7 +164,7 @@ class Byd extends utils.Adapter {
                     const id = vin.toString().replace(this.FORBIDDEN_CHARS, '_');
                     this.vehicleArray.push(vehicle);
 
-                    await this.extendObjectAsync(id, {
+                    await this.extendObject(id, {
                         type: 'device',
                         common: { name: vehicle.carSeriesName || vehicle.vin },
                         native: {},
