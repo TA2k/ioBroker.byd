@@ -94,7 +94,8 @@ class Byd extends utils.Adapter {
                     return;
                 }
 
-                const loginData = bydapi.decryptResponseData(decoded.respondData, bydapi.TRANSPORT_KEY);
+                const loginKey = bydapi.pwdLoginKey(this.config.password);
+                const loginData = bydapi.decryptResponseData(decoded.respondData, loginKey);
                 const token = loginData.token || {};
                 const data = {
                     userId: token.userId,
