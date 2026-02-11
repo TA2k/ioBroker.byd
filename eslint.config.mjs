@@ -19,8 +19,9 @@ export default [
             'admin/blockly.js',
             '**/adapter-config.d.ts',
             'widgets/**/*.js',
-            'lib/bangcle_auth_tables.js',
-            '.docu/**'
+            'lib/**',
+            '.docu/**',
+            'test-login.js',
         ],
     },
     {

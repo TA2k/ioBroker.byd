@@ -25,6 +25,6 @@
         // "noUnusedParameters": true,
         "useUnknownInCatchVariables": false
     },
-    "include": ["**/*.js", "**/*.d.ts"],
+    "include": ["**/*.js", "**/*.d.ts", ".docu/BYD-re/test-login.js"],
     "exclude": ["node_modules/**", "widgets/**"]
 }
