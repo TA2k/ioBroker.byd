@@ -152,7 +152,21 @@ class Byd extends utils.Adapter {
                 const data = bydapi.decryptResponseData(decoded.respondData, contentKey);
                 this.log.debug(`Vehicle list: ${JSON.stringify(data)}`);
 
-                const vehicles = data.allCarList || [];
+                // Sample: [{
+                //   "vin": "LGXXXXXXXXXXX00000", "autoAlias": "BYD SEALION 7", "autoPlate": "AB123CD",
+                //   "brandName": "BYD", "modelName": "BYD SEALION 7", "modelId": 28,
+                //   "totalMileage": 13060, "energyType": "0", "carType": 0,
+                //   "defaultCar": 1, "permissionStatus": 3, "tboxVersion": "3",
+                //   "vehicleState": "0", "vehicleTimeZone": "Europe/Vienna",
+                //   "autoBoughtTime": 1742770800000, "yunActiveTime": 1742770800000,
+                //   "cfPic": { "picMainUrl": "https://...", "picSetUrl": "https://..." },
+                //   "vehicleFunLearnInfo": {
+                //     "bookingCharge": 2, "batteryHeating": 1, "steeringWheelHeating": 1,
+                //     "openWindowLearnInfo": 1, "trunkLearnInfo": 1, "gpsLearnInfo": 1, ...
+                //   },
+                //   "rangeDetailList": [{ "code": "2", "name": "Schlüssel und Steuerung", ... }]
+                // }]
+                const vehicles = data || [];
                 this.log.info(`Found ${vehicles.length} vehicle(s)`);
 
                 for (const vehicle of vehicles) {
@@ -426,7 +440,7 @@ class Byd extends utils.Adapter {
             });
     }
 
-    async sendRemoteControl(vin, instructionCode, commandType = null, controlParamsMap = null) {
+    async sendRemoteControl(vin, commandType, controlParamsMap = null) {
         if (!this.session) {
             return;
         }
@@ -438,8 +452,6 @@ class Byd extends utils.Adapter {
             this.config.language,
             this.deviceConfig,
             vin,
-            instructionCode,
-            null,
             commandType,
             controlParamsMap,
             this.config.controlPin || null,
@@ -486,7 +498,9 @@ class Byd extends utils.Adapter {
                 this.config.language,
                 this.deviceConfig,
                 vin,
-                instructionCode,
+                commandType,
+                null,
+                null,
                 requestSerial,
             );
 
@@ -511,7 +525,7 @@ class Byd extends utils.Adapter {
                         if (bydapi.isRemoteControlReady(data)) {
                             const success = data.controlState === '1' || data.controlState === 1;
                             if (success) {
-                                this.log.info(`Remote control success: ${instructionCode}`);
+                                this.log.info(`Remote control success: ${commandType}`);
                             } else {
                                 this.log.warn(`Remote control completed with state: ${data.controlState}`);
                             }
@@ -567,7 +581,7 @@ class Byd extends utils.Adapter {
                         airAccuracy: 1,
                         airConditioningMode: 1,
                     };
-                    await this.sendRemoteControl(deviceId, null, 'OPENAIR', controlParamsMap);
+                    await this.sendRemoteControl(deviceId, 'OPENAIR', controlParamsMap);
                 } else {
                     // Climate OFF
                     const controlParamsMap = {
@@ -580,7 +594,7 @@ class Byd extends utils.Adapter {
                         airAccuracy: 1,
                         airConditioningMode: 0,
                     };
-                    await this.sendRemoteControl(deviceId, null, 'CLOSEAIR', controlParamsMap);
+                    await this.sendRemoteControl(deviceId, 'CLOSEAIR', controlParamsMap);
                 }
 
                 await this.setStateAsync(id, state.val, true);
@@ -612,7 +626,7 @@ class Byd extends utils.Adapter {
                     rrThirdVentilationState: 0,
                     steeringWheelHeatState: state.val ? 1 : 0,
                 };
-                await this.sendRemoteControl(deviceId, null, 'VENTILATIONHEATING', controlParamsMap);
+                await this.sendRemoteControl(deviceId, 'VENTILATIONHEATING', controlParamsMap);
 
                 await this.setStateAsync(id, state.val, true);
                 this.refreshTimeout && clearTimeout(this.refreshTimeout);
@@ -639,7 +653,7 @@ class Byd extends utils.Adapter {
 
             this.log.info(`Sending remote command: ${command} (${commandType}) for ${deviceId}`);
 
-            await this.sendRemoteControl(deviceId, null, commandType, null);
+            await this.sendRemoteControl(deviceId, commandType);
 
             // Acknowledge the state change
             await this.setStateAsync(id, state.val, true);
