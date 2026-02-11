@@ -183,6 +183,7 @@ class Byd extends utils.Adapter {
                         { command: 'flash', name: 'True = Flash Lights' },
                         { command: 'horn', name: 'True = Horn' },
                         { command: 'climate', name: 'True = Start Climate, False = Stop Climate' },
+                        { command: 'seatHeat', name: 'True = Start Seat Heating, False = Stop' },
                     ];
 
                     for (const remote of remoteArray) {
@@ -424,7 +425,7 @@ class Byd extends utils.Adapter {
             });
     }
 
-    async sendRemoteControl(vin, instructionCode) {
+    async sendRemoteControl(vin, instructionCode, commandType = null, controlParamsMap = null) {
         if (!this.session) {
             return;
         }
@@ -437,6 +438,10 @@ class Byd extends utils.Adapter {
             this.deviceConfig,
             vin,
             instructionCode,
+            null,
+            commandType,
+            controlParamsMap,
+            this.config.controlPin || null,
         );
 
         let requestSerial = null;
@@ -545,23 +550,94 @@ class Byd extends utils.Adapter {
                 return;
             }
 
-            const commandMap = {
-                lock: '10',
-                unlock: '11',
-                flash: '20',
-                horn: '21',
-                climate: state.val ? '30' : '31',
+            // Climate uses different format with commandType and controlParamsMap
+            if (command === 'climate') {
+                this.log.info(`Sending climate command: ${state.val ? 'ON' : 'OFF'} for ${deviceId}`);
+
+                if (state.val) {
+                    // Climate ON
+                    const controlParamsMap = {
+                        airSet: null,
+                        remoteMode: 4,
+                        timeSpan: 1,
+                        mainSettingTemp: 7,
+                        copilotSettingTemp: 7,
+                        cycleMode: 2,
+                        airAccuracy: 1,
+                        airConditioningMode: 1,
+                    };
+                    await this.sendRemoteControl(deviceId, null, 'OPENAIR', controlParamsMap);
+                } else {
+                    // Climate OFF
+                    const controlParamsMap = {
+                        airSet: null,
+                        remoteMode: 4,
+                        timeSpan: 0,
+                        mainSettingTemp: 7,
+                        copilotSettingTemp: 7,
+                        cycleMode: 2,
+                        airAccuracy: 1,
+                        airConditioningMode: 0,
+                    };
+                    await this.sendRemoteControl(deviceId, null, 'CLOSEAIR', controlParamsMap);
+                }
+
+                await this.setStateAsync(id, state.val, true);
+                this.refreshTimeout && clearTimeout(this.refreshTimeout);
+                this.refreshTimeout = setTimeout(() => {
+                    this.updateVehicles();
+                }, 10 * 1000);
+                return;
+            }
+
+            // Seat heating uses VENTILATIONHEATING commandType
+            if (command === 'seatHeat') {
+                this.log.info(`Sending seat heating command: ${state.val ? 'ON' : 'OFF'} for ${deviceId}`);
+
+                const controlParamsMap = {
+                    chairType: '5',
+                    remoteMode: state.val ? 1 : 0,
+                    mainHeat: state.val ? 3 : 0,
+                    mainVentilation: 0,
+                    copilotHeat: state.val ? 3 : 0,
+                    copilotVentilation: 0,
+                    lrSeatHeatState: 0,
+                    lrSeatVentilationState: 0,
+                    lrThirdHeatState: 0,
+                    lrThirdVentilationState: 0,
+                    rrSeatHeatState: 0,
+                    rrSeatVentilationState: 0,
+                    rrThirdHeatState: 0,
+                    rrThirdVentilationState: 0,
+                    steeringWheelHeatState: state.val ? 1 : 0,
+                };
+                await this.sendRemoteControl(deviceId, null, 'VENTILATIONHEATING', controlParamsMap);
+
+                await this.setStateAsync(id, state.val, true);
+                this.refreshTimeout && clearTimeout(this.refreshTimeout);
+                this.refreshTimeout = setTimeout(() => {
+                    this.updateVehicles();
+                }, 10 * 1000);
+                return;
+            }
+
+            // Commands using commandType (no controlParamsMap needed)
+            const commandTypeMap = {
+                lock: 'LOCKDOOR',
+                unlock: 'OPENDOOR',
+                flash: 'FINDCAR',
+                horn: 'FLASHLIGHTNOWHISTLE',
             };
 
-            const instructionCode = commandMap[command];
-            if (!instructionCode) {
+            const commandType = commandTypeMap[command];
+            if (!commandType) {
                 this.log.warn(`Unknown command: ${command}`);
                 return;
             }
 
-            this.log.info(`Sending remote command: ${command} for ${deviceId}`);
+            this.log.info(`Sending remote command: ${command} (${commandType}) for ${deviceId}`);
 
-            await this.sendRemoteControl(deviceId, instructionCode);
+            await this.sendRemoteControl(deviceId, null, commandType, null);
 
             // Acknowledge the state change
             await this.setStateAsync(id, state.val, true);

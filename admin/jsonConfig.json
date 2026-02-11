@@ -40,6 +40,30 @@
             "visible": true,
             "sm": 6
         },
+        "controlPin": {
+            "type": "password",
+            "label": {
+                "en": "Control PIN (optional)",
+                "de": "Steuerungs-PIN (optional)",
+                "ru": "PIN управления (необязательно)",
+                "pt": "PIN de controle (opcional)",
+                "nl": "Controle PIN (optioneel)",
+                "fr": "PIN de contrôle (optionnel)",
+                "it": "PIN di controllo (opzionale)",
+                "es": "PIN de control (opcional)",
+                "pl": "PIN sterowania (opcjonalnie)",
+                "uk": "PIN керування (необов'язково)",
+                "zh-cn": "控制PIN（可选）"
+            },
+            "help": {
+                "en": "Required for remote commands like lock/unlock if configured in BYD app",
+                "de": "Erforderlich für Fernbefehle wie Verriegeln/Entriegeln, wenn in der BYD-App konfiguriert"
+            },
+            "newLine": true,
+            "repeat": false,
+            "visible": true,
+            "sm": 6
+        },
         "countryCode": {
             "type": "text",
             "label": {
