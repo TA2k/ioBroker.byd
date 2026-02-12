@@ -7,6 +7,8 @@ const { CookieJar } = require('tough-cookie');
 const Json2iob = require('json2iob');
 const bydapi = require('./lib/bydapi');
 const devicegen = require('./lib/devicegen');
+const descriptions = require('./lib/descriptions.json');
+const states = require('./lib/states.json');
 
 class Byd extends utils.Adapter {
     constructor(options) {
@@ -25,6 +27,10 @@ class Byd extends utils.Adapter {
         this.refreshTimeout = null;
         this.session = null;
         this.deviceConfig = bydapi.DEFAULT_DEVICE_CONFIG;
+        // Track unsupported endpoints per VIN to avoid repeated 1001 errors
+        this.unsupportedEndpoints = {}; // { vin: Set(['energy', 'hvac', 'charging']) }
+        // Cache realtime data for fallback
+        this.realtimeCache = {}; // { vin: {...} }
 
         const jar = new CookieJar();
         this.requestClient = wrapper(
@@ -130,6 +136,17 @@ class Byd extends utils.Adapter {
                     return;
                 }
 
+                // Sample loginData:
+                // {
+                //   "token": {
+                //     "userId": "1234567890123456789",
+                //     "signToken": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+                //     "encryToken": "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy",
+                //     "accessToken": "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"
+                //   },
+                //   "user": { "nickname": "User", "email": "user@example.com", "countryCode": "AT" },
+                //   "securityInfo": { "isPwdSet": 1, "isGesturePwdSet": 0 }
+                // }
                 const loginKey = bydapi.pwdLoginKey(this.config.password);
                 const loginData = bydapi.decryptResponseData(decoded.respondData, loginKey);
                 const token = loginData.token || {};
@@ -181,7 +198,14 @@ class Byd extends utils.Adapter {
                 const decoded = bydapi.decodeEnvelope(res.data);
 
                 if (decoded.code !== '0') {
-                    this.log.error(`Vehicle list failed: code=${decoded.code} message=${decoded.message || ''}`);
+                    if (bydapi.isSessionExpired(decoded.code)) {
+                        this.log.warn(`Session expired (code=${decoded.code}) - re-authenticating`);
+                        this.session = null;
+                        await this.login();
+                        // Retry would require restructuring - for now just return
+                    } else {
+                        this.log.error(`Vehicle list failed: code=${decoded.code} message=${decoded.message || ''}`);
+                    }
                     return;
                 }
 
@@ -252,7 +276,11 @@ class Byd extends utils.Adapter {
                         });
                     }
 
-                    this.json2iob.parse(id, vehicle, { forceIndex: true });
+                    this.json2iob.parse(id, vehicle, {
+                        forceIndex: true,
+                        descriptions,
+                        states,
+                    });
                 }
             })
             .catch(error => {
@@ -269,6 +297,8 @@ class Byd extends utils.Adapter {
             await this.pollVehicleRealtime(vin, id);
             await this.pollGpsInfo(vin, id);
             await this.getEnergyConsumption(vin, id);
+            await this.getHvacStatus(vin, id);
+            await this.getChargingStatus(vin, id);
         }
     }
 
@@ -300,6 +330,7 @@ class Byd extends utils.Adapter {
             .then(async res => {
                 this.log.debug(`Realtime trigger response: ${JSON.stringify(res.data)}`);
                 const decoded = bydapi.decodeEnvelope(res.data);
+                // Sample trigger response: { "requestSerial": "20250612000000000012345678" }
                 if (decoded.code === '0' && decoded.respondData) {
                     const data = bydapi.decryptResponseData(decoded.respondData, triggerReq.contentKey);
                     requestSerial = data.requestSerial || null;
@@ -310,6 +341,22 @@ class Byd extends utils.Adapter {
             });
 
         // Poll for result (up to 10 attempts)
+        // Sample poll response:
+        // {
+        //   "requestSerial": "20250612000000000012345678", "vin": "LGXXXXXXXXXXX00000",
+        //   "soc": "75", "enduranceMileage": "320", "totalMileage": "13060",
+        //   "leftFrontTirepressure": "253", "rightFrontTirepressure": "250",
+        //   "leftRearTirepressure": "248", "rightRearTirepressure": "251",
+        //   "leftFrontDoorStatus": "2", "rightFrontDoorStatus": "2",
+        //   "leftRearDoorStatus": "2", "rightRearDoorStatus": "2",
+        //   "leftFrontWindowStatus": "2", "rightFrontWindowStatus": "2",
+        //   "leftRearWindowStatus": "2", "rightRearWindowStatus": "2",
+        //   "sunRoofStatus": "2", "engineSt": "0", "bonnetStatus": "2", "bootStatus": "2",
+        //   "doorLockStatus": "1", "chargeStatus": "0", "onlineState": "1",
+        //   "time": 1749732195000, "longitudeDone": "16.xxxxxx", "latitudeDone": "48.xxxxxx",
+        //   "altitude": "196", "heading": "123.45", "airState": "0", "airTemp": "0",
+        //   "remainChargingTime": "0", "timezoneOffset": "+02:00"
+        // }
         for (let attempt = 0; attempt < 10; attempt++) {
             await this.sleep(1500);
 
@@ -341,7 +388,13 @@ class Byd extends utils.Adapter {
                         this.log.debug(`Realtime data: ${JSON.stringify(data)}`);
 
                         if (bydapi.isRealtimeDataReady(data)) {
-                            this.json2iob.parse(id, data, { forceIndex: true });
+                            // Cache realtime data for fallback (e.g. energy endpoint)
+                            this.realtimeCache[vin] = data;
+                            this.json2iob.parse(id, data, {
+                                forceIndex: true,
+                                descriptions,
+                                states,
+                            });
                             ready = true;
                         }
                     }
@@ -384,6 +437,7 @@ class Byd extends utils.Adapter {
             .then(async res => {
                 this.log.debug(`GPS trigger response: ${JSON.stringify(res.data)}`);
                 const decoded = bydapi.decodeEnvelope(res.data);
+                // Sample trigger response: { "requestSerial": "20250612000000000012345678" }
                 if (decoded.code === '0' && decoded.respondData) {
                     const data = bydapi.decryptResponseData(decoded.respondData, triggerReq.contentKey);
                     requestSerial = data.requestSerial || null;
@@ -394,6 +448,13 @@ class Byd extends utils.Adapter {
             });
 
         // Poll for result (up to 10 attempts)
+        // Sample poll response:
+        // {
+        //   "requestSerial": "20250612000000000012345678",
+        //   "longitudeDone": "16.xxxxxx", "latitudeDone": "48.xxxxxx",
+        //   "altitude": "196", "speed": "0", "heading": "123.45",
+        //   "time": 1749732195000, "gpsState": "1"
+        // }
         for (let attempt = 0; attempt < 10; attempt++) {
             await this.sleep(1500);
 
@@ -425,7 +486,11 @@ class Byd extends utils.Adapter {
                         this.log.debug(`GPS data: ${JSON.stringify(data)}`);
 
                         if (bydapi.isGpsDataReady(data)) {
-                            this.json2iob.parse(`${id}.gps`, data, { forceIndex: true });
+                            this.json2iob.parse(`${id}.gps`, data, {
+                                forceIndex: true,
+                                descriptions,
+                                states,
+                            });
                             ready = true;
                         }
                     }
@@ -442,6 +507,24 @@ class Byd extends utils.Adapter {
 
     async getEnergyConsumption(vin, id) {
         if (!this.session) {
+            return;
+        }
+
+        // Skip if endpoint is known to be unsupported for this VIN
+        if (this.unsupportedEndpoints[vin]?.has('energy')) {
+            // Use fallback from realtime cache
+            const cached = this.realtimeCache[vin];
+            if (cached && cached.totalEnergy) {
+                const fallbackData = {
+                    totalEnergy: cached.totalEnergy,
+                    _fallback: true,
+                };
+                this.json2iob.parse(`${id}.energy`, fallbackData, {
+                    forceIndex: true,
+                    descriptions,
+                    states,
+                });
+            }
             return;
         }
 
@@ -465,14 +548,161 @@ class Byd extends utils.Adapter {
             .then(async res => {
                 this.log.debug(`Energy consumption response: ${JSON.stringify(res.data)}`);
                 const decoded = bydapi.decodeEnvelope(res.data);
+                // Sample response:
+                // {
+                //   "avgConsumption": "18.5", "avgConsumptionUnit": "kWh/100km",
+                //   "totalConsumption": "2405.2", "totalConsumptionUnit": "kWh",
+                //   "dailyList": [{ "date": "2025-02-10", "consumption": "12.3" }, ...]
+                // }
                 if (decoded.code === '0' && decoded.respondData) {
                     const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
                     this.log.debug(`Energy consumption data: ${JSON.stringify(data)}`);
-                    this.json2iob.parse(`${id}.energy`, data, { forceIndex: true });
+                    this.json2iob.parse(`${id}.energy`, data, {
+                        forceIndex: true,
+                        descriptions,
+                        states,
+                    });
+                } else if (bydapi.isSessionExpired(decoded.code)) {
+                    this.log.warn(`Session expired (code=${decoded.code}) - will re-authenticate on next cycle`);
+                    this.session = null;
+                } else if (decoded.code === '1001') {
+                    // Endpoint not supported for this vehicle - remember and use fallback
+                    this.log.info(`Energy endpoint not supported for ${vin} - using realtime fallback`);
+                    if (!this.unsupportedEndpoints[vin]) {
+                        this.unsupportedEndpoints[vin] = new Set();
+                    }
+                    this.unsupportedEndpoints[vin].add('energy');
+                    // Use fallback from realtime cache
+                    const cached = this.realtimeCache[vin];
+                    if (cached && cached.totalEnergy) {
+                        const fallbackData = {
+                            totalEnergy: cached.totalEnergy,
+                            _fallback: true,
+                        };
+                        this.json2iob.parse(`${id}.energy`, fallbackData, {
+                            forceIndex: true,
+                            descriptions,
+                            states,
+                        });
+                    }
                 }
             })
             .catch(error => {
                 this.log.error(`Energy consumption error: ${error.message}`);
+            });
+    }
+
+    async getHvacStatus(vin, id) {
+        if (!this.session) {
+            return;
+        }
+
+        // Skip if endpoint is known to be unsupported for this VIN
+        if (this.unsupportedEndpoints[vin]?.has('hvac')) {
+            return;
+        }
+
+        const req = bydapi.buildHvacStatusRequest(
+            this.session,
+            this.config.countryCode,
+            this.config.language,
+            this.deviceConfig,
+            vin,
+        );
+
+        await this.requestClient({
+            method: 'post',
+            url: `${bydapi.BASE_URL}/control/getStatusNow`,
+            headers: {
+                'User-Agent': bydapi.USER_AGENT,
+                'Content-Type': 'application/json; charset=UTF-8',
+            },
+            data: { request: bydapi.encodeEnvelope(req.outer) },
+        })
+            .then(async res => {
+                this.log.debug(`HVAC status response: ${JSON.stringify(res.data)}`);
+                const decoded = bydapi.decodeEnvelope(res.data);
+                // Sample response:
+                // { "airState": "0", "airTemp": "22", "mainSeatHeat": "0", "steeringWheelHeat": "0" }
+                if (decoded.code === '0' && decoded.respondData) {
+                    const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
+                    this.log.debug(`HVAC status data: ${JSON.stringify(data)}`);
+                    this.json2iob.parse(`${id}.hvac`, data, {
+                        forceIndex: true,
+                        descriptions,
+                        states,
+                    });
+                } else if (bydapi.isSessionExpired(decoded.code)) {
+                    this.log.warn(`Session expired (code=${decoded.code}) - will re-authenticate on next cycle`);
+                    this.session = null;
+                } else if (decoded.code === '1001') {
+                    // Endpoint not supported for this vehicle
+                    this.log.info(`HVAC endpoint not supported for ${vin}`);
+                    if (!this.unsupportedEndpoints[vin]) {
+                        this.unsupportedEndpoints[vin] = new Set();
+                    }
+                    this.unsupportedEndpoints[vin].add('hvac');
+                }
+            })
+            .catch(error => {
+                this.log.error(`HVAC status error: ${error.message}`);
+            });
+    }
+
+    async getChargingStatus(vin, id) {
+        if (!this.session) {
+            return;
+        }
+
+        // Skip if endpoint is known to be unsupported for this VIN
+        if (this.unsupportedEndpoints[vin]?.has('charging')) {
+            return;
+        }
+
+        const req = bydapi.buildChargingStatusRequest(
+            this.session,
+            this.config.countryCode,
+            this.config.language,
+            this.deviceConfig,
+            vin,
+        );
+
+        await this.requestClient({
+            method: 'post',
+            url: `${bydapi.BASE_URL}/control/smartCharge/homePage`,
+            headers: {
+                'User-Agent': bydapi.USER_AGENT,
+                'Content-Type': 'application/json; charset=UTF-8',
+            },
+            data: { request: bydapi.encodeEnvelope(req.outer) },
+        })
+            .then(async res => {
+                this.log.debug(`Charging status response: ${JSON.stringify(res.data)}`);
+                const decoded = bydapi.decodeEnvelope(res.data);
+                // Sample response:
+                // { "soc": "75", "chargeStatus": "0", "remainChargingTime": "0", "chargingPower": "0" }
+                if (decoded.code === '0' && decoded.respondData) {
+                    const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
+                    this.log.debug(`Charging status data: ${JSON.stringify(data)}`);
+                    this.json2iob.parse(`${id}.charging`, data, {
+                        forceIndex: true,
+                        descriptions,
+                        states,
+                    });
+                } else if (bydapi.isSessionExpired(decoded.code)) {
+                    this.log.warn(`Session expired (code=${decoded.code}) - will re-authenticate on next cycle`);
+                    this.session = null;
+                } else if (decoded.code === '1001') {
+                    // Endpoint not supported for this vehicle
+                    this.log.info(`Charging endpoint not supported for ${vin}`);
+                    if (!this.unsupportedEndpoints[vin]) {
+                        this.unsupportedEndpoints[vin] = new Set();
+                    }
+                    this.unsupportedEndpoints[vin].add('charging');
+                }
+            })
+            .catch(error => {
+                this.log.error(`Charging status error: ${error.message}`);
             });
     }
 
@@ -507,6 +737,7 @@ class Byd extends utils.Adapter {
             .then(async res => {
                 this.log.debug(`Remote control trigger response: ${JSON.stringify(res.data)}`);
                 const decoded = bydapi.decodeEnvelope(res.data);
+                // Sample trigger response: { "requestSerial": "20250612000000000012345678" }
                 if (decoded.code !== '0') {
                     this.log.error(`Remote control failed: code=${decoded.code} message=${decoded.message || ''}`);
                 } else if (decoded.respondData) {
@@ -525,6 +756,8 @@ class Byd extends utils.Adapter {
         }
 
         // Poll for result (up to 10 attempts)
+        // Sample poll response: { "requestSerial": "...", "controlState": "1", "vin": "LGXXX..." }
+        // controlState: 0=pending, 1=success, 2=failed
         for (let attempt = 0; attempt < 10; attempt++) {
             await this.sleep(1500);
 

@@ -1,0 +1,130 @@
+{
+  "onlineState": {
+    "0": "Unknown",
+    "1": "Online",
+    "2": "Offline"
+  },
+  "connectState": {
+    "-1": "Unknown",
+    "0": "Disconnected",
+    "1": "Connected"
+  },
+  "vehicleState": {
+    "0": "Standby",
+    "1": "Active"
+  },
+  "powerGear": {
+    "1": "Parked",
+    "3": "Drive"
+  },
+  "airRunState": {
+    "0": "External",
+    "1": "Internal"
+  },
+  "seatHeatVentState": {
+    "0": "Off",
+    "1": "Level 1",
+    "2": "Low",
+    "3": "High"
+  },
+  "chargingState": {
+    "-1": "Disconnected",
+    "0": "Not Charging",
+    "15": "Gun Connected"
+  },
+  "doorOpenState": {
+    "0": "Closed",
+    "1": "Open"
+  },
+  "lockState": {
+    "0": "Locked",
+    "1": "Unlocked",
+    "2": "Locked"
+  },
+  "windowState": {
+    "0": "Open",
+    "1": "Closed",
+    "2": "Open"
+  },
+  "tirePressUnit": {
+    "1": "bar",
+    "2": "psi",
+    "3": "kPa"
+  },
+  "tireStatus": {
+    "0": "Normal"
+  },
+  "controlState": {
+    "0": "Pending",
+    "1": "Success",
+    "2": "Failure"
+  },
+  "energyType": {
+    "0": "EV",
+    "1": "PHEV",
+    "2": "Hybrid"
+  },
+  "empowerType": {
+    "-1": "Shared User",
+    "2": "Owner"
+  },
+  "permissionStatus": {
+    "2": "Full Permissions",
+    "3": "Full Permissions"
+  },
+  "acSwitch": {
+    "0": "Off",
+    "1": "On"
+  },
+  "cycleChoice": {
+    "0": "Internal Recirculation",
+    "1": "External Air"
+  },
+  "defrostStatus": {
+    "0": "Off",
+    "1": "On"
+  },
+  "refrigeratorState": {
+    "0": "Off",
+    "1": "On"
+  },
+  "refrigeratorDoorState": {
+    "0": "Closed",
+    "1": "Open"
+  },
+  "sentryStatus": {
+    "0": "Off",
+    "1": "On",
+    "2": "Active"
+  },
+  "batteryHeatState": {
+    "0": "Off",
+    "1": "On"
+  },
+  "chargeHeatState": {
+    "0": "Off",
+    "1": "On"
+  },
+  "upgradeStatus": {
+    "0": "None",
+    "1": "Available",
+    "2": "In Progress"
+  },
+  "warningState": {
+    "0": "Normal",
+    "1": "Warning",
+    "2": "Error"
+  },
+  "epb": {
+    "0": "Released",
+    "1": "Engaged"
+  },
+  "gpsState": {
+    "0": "Invalid",
+    "1": "Valid"
+  },
+  "bookingChargeState": {
+    "0": "Off",
+    "1": "Scheduled"
+  }
+}
