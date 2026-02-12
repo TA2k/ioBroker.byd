@@ -11,15 +11,18 @@
   },
   "vehicleState": {
     "0": "Standby",
-    "1": "Active"
+    "1": "Active",
+    "2": "Unknown"
   },
   "powerGear": {
+    "0": "Unknown",
     "1": "Parked",
     "3": "Drive"
   },
   "airRunState": {
     "0": "External",
-    "1": "Internal"
+    "1": "Internal",
+    "2": "Outside Fresh"
   },
   "seatHeatVentState": {
     "0": "Off",
@@ -30,6 +33,7 @@
   "chargingState": {
     "-1": "Disconnected",
     "0": "Not Charging",
+    "1": "Charging",
     "15": "Gun Connected"
   },
   "doorOpenState": {
@@ -37,12 +41,12 @@
     "1": "Open"
   },
   "lockState": {
-    "0": "Locked",
+    "0": "Unknown",
     "1": "Unlocked",
     "2": "Locked"
   },
   "windowState": {
-    "0": "Open",
+    "0": "Unknown",
     "1": "Closed",
     "2": "Open"
   },
@@ -159,5 +163,29 @@
     "0": "Pending",
     "1": "Failure",
     "2": "Success"
+  },
+  "airState": {
+    "0": "Off",
+    "1": "On"
+  },
+  "chargeStatus": {
+    "0": "Not Charging",
+    "1": "Charging"
+  },
+  "engineSt": {
+    "0": "Off",
+    "1": "On"
+  },
+  "doorLockStatus": {
+    "1": "Unlocked",
+    "2": "Locked"
+  },
+  "bonnetStatus": {
+    "0": "Open",
+    "2": "Closed"
+  },
+  "bootStatus": {
+    "0": "Open",
+    "2": "Closed"
   }
 }

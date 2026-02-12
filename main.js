@@ -203,13 +203,10 @@ class Byd extends utils.Adapter {
                 const decoded = bydapi.decodeEnvelope(res.data);
 
                 if (decoded.code !== '0') {
-                    if (bydapi.isSessionExpired(decoded.code)) {
-                        this.log.warn(`Session expired (code=${decoded.code}) - re-authenticating`);
-                        this.session = null;
-                        await this.login();
-                        // Retry would require restructuring - for now just return
-                    } else {
-                        this.log.error(`Vehicle list failed: code=${decoded.code} message=${decoded.message || ''}`);
+                    if (await this.handleSessionExpired(decoded.code, 'getVehicleList')) {
+                        this.log.info('Session restored, vehicle list will refresh on next cycle');
+                    } else if (!bydapi.isSessionExpired(decoded.code)) {
+                        this.log.error(`Vehicle list failed: code=${decoded.code}`);
                     }
                     return;
                 }
@@ -295,6 +292,16 @@ class Byd extends utils.Adapter {
     }
 
     async updateVehicles() {
+        // Check session before starting updates
+        if (!this.session) {
+            this.log.warn('No session - attempting re-login before vehicle update');
+            await this.login();
+            if (!this.session) {
+                this.log.error('Re-login failed, skipping vehicle update');
+                return;
+            }
+        }
+
         for (const vehicle of this.vehicleArray) {
             const vin = vehicle.vin;
             const id = vin.toString().replace(this.FORBIDDEN_CHARS, '_');
@@ -305,6 +312,24 @@ class Byd extends utils.Adapter {
             await this.getHvacStatus(vin, id);
             await this.getChargingStatus(vin, id);
         }
+    }
+
+    /**
+     * Handle session expired error - re-login and return true if successful
+     *
+     * @param {string} code - API error code
+     * @param {string} context - Context description for logging
+     * @returns {Promise<boolean>} - True if re-login succeeded
+     */
+    async handleSessionExpired(code, context) {
+        if (!bydapi.isSessionExpired(code)) {
+            return false;
+        }
+        this.log.warn(`Session expired (code=${code}) in ${context} - re-authenticating`);
+        this.session = null;
+        this.setState('info.connection', false, true);
+        await this.login();
+        return !!this.session;
     }
 
     async pollVehicleRealtime(vin, id) {
@@ -568,9 +593,8 @@ class Byd extends utils.Adapter {
                         states,
                     });
                 } else if (bydapi.isSessionExpired(decoded.code)) {
-                    this.log.warn(`Session expired (code=${decoded.code}) - will re-authenticate on next cycle`);
-                    this.session = null;
-                } else if (decoded.code === '1001') {
+                    await this.handleSessionExpired(decoded.code, 'getEnergyConsumption');
+                } else if (bydapi.isEndpointNotSupported(decoded.code)) {
                     // Endpoint not supported for this vehicle - remember and use fallback
                     this.log.info(`Energy endpoint not supported for ${vin} - using realtime fallback`);
                     if (!this.unsupportedEndpoints[vin]) {
@@ -638,9 +662,8 @@ class Byd extends utils.Adapter {
                         states,
                     });
                 } else if (bydapi.isSessionExpired(decoded.code)) {
-                    this.log.warn(`Session expired (code=${decoded.code}) - will re-authenticate on next cycle`);
-                    this.session = null;
-                } else if (decoded.code === '1001') {
+                    await this.handleSessionExpired(decoded.code, 'getHvacStatus');
+                } else if (bydapi.isEndpointNotSupported(decoded.code)) {
                     // Endpoint not supported for this vehicle
                     this.log.info(`HVAC endpoint not supported for ${vin}`);
                     if (!this.unsupportedEndpoints[vin]) {
@@ -695,9 +718,8 @@ class Byd extends utils.Adapter {
                         states,
                     });
                 } else if (bydapi.isSessionExpired(decoded.code)) {
-                    this.log.warn(`Session expired (code=${decoded.code}) - will re-authenticate on next cycle`);
-                    this.session = null;
-                } else if (decoded.code === '1001') {
+                    await this.handleSessionExpired(decoded.code, 'getChargingStatus');
+                } else if (bydapi.isEndpointNotSupported(decoded.code)) {
                     // Endpoint not supported for this vehicle
                     this.log.info(`Charging endpoint not supported for ${vin}`);
                     if (!this.unsupportedEndpoints[vin]) {
@@ -870,10 +892,13 @@ class Byd extends utils.Adapter {
         }
     }
 
-    async sendRemoteControl(vin, commandType, controlParamsMap = null) {
+    async sendRemoteControl(vin, commandType, controlParamsMap = null, retryCount = 0) {
         if (!this.session) {
-            return;
+            return { success: false, error: 'No session' };
         }
+
+        const MAX_RATE_LIMIT_RETRIES = 3;
+        const RATE_LIMIT_DELAY_MS = 5000;
 
         // Trigger remote control
         const triggerReq = bydapi.buildRemoteControlRequest(
@@ -888,6 +913,8 @@ class Byd extends utils.Adapter {
         );
 
         let requestSerial = null;
+        let shouldRetry = false;
+        let errorCode = null;
 
         await this.requestClient({
             method: 'post',
@@ -901,8 +928,45 @@ class Byd extends utils.Adapter {
             .then(async res => {
                 this.log.debug(`Remote control trigger response: ${JSON.stringify(res.data)}`);
                 const decoded = bydapi.decodeEnvelope(res.data);
+                errorCode = decoded.code;
+
                 // Sample trigger response: { "requestSerial": "20250612000000000012345678" }
                 if (decoded.code !== '0') {
+                    // Check for control password errors
+                    if (bydapi.isControlPasswordError(decoded.code)) {
+                        const errMsg = bydapi.getControlPasswordErrorMessage(decoded.code);
+                        this.log.error(`Remote control failed: ${errMsg}`);
+                        return;
+                    }
+
+                    // Check for rate limit - retry after delay
+                    if (bydapi.isRateLimited(decoded.code)) {
+                        this.log.warn(
+                            `Remote control rate limited (code=${decoded.code}), attempt ${retryCount + 1}/${MAX_RATE_LIMIT_RETRIES}`,
+                        );
+                        if (retryCount < MAX_RATE_LIMIT_RETRIES) {
+                            shouldRetry = true;
+                        } else {
+                            this.log.error(
+                                `Remote control failed: rate limit exceeded after ${MAX_RATE_LIMIT_RETRIES} retries`,
+                            );
+                        }
+                        return;
+                    }
+
+                    // Check for session expired
+                    if (bydapi.isSessionExpired(decoded.code)) {
+                        this.log.warn(
+                            `Session expired during remote control (code=${decoded.code}) - re-authenticating`,
+                        );
+                        this.session = null;
+                        await this.login();
+                        if (this.session && retryCount < 1) {
+                            shouldRetry = true;
+                        }
+                        return;
+                    }
+
                     this.log.error(`Remote control failed: code=${decoded.code} message=${decoded.message || ''}`);
                 } else if (decoded.respondData) {
                     const data = bydapi.decryptResponseData(decoded.respondData, triggerReq.contentKey);
@@ -914,6 +978,14 @@ class Byd extends utils.Adapter {
                 this.log.error(`Remote control error: ${error.message}`);
                 error.response && this.log.error(JSON.stringify(error.response.data));
             });
+
+        // Handle retry for rate limit or session expired
+        if (shouldRetry) {
+            const delay = bydapi.isRateLimited(errorCode) ? RATE_LIMIT_DELAY_MS : 1000;
+            this.log.info(`Retrying remote control in ${delay}ms...`);
+            await this.sleep(delay);
+            return this.sendRemoteControl(vin, commandType, controlParamsMap, retryCount + 1);
+        }
 
         if (!requestSerial) {
             return;
