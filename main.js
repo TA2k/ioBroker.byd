@@ -4,6 +4,7 @@ const utils = require('@iobroker/adapter-core');
 const axios = require('axios').default;
 const { wrapper } = require('axios-cookiejar-support');
 const { CookieJar } = require('tough-cookie');
+const mqtt = require('mqtt');
 const Json2iob = require('json2iob');
 const bydapi = require('./lib/bydapi');
 const devicegen = require('./lib/devicegen');
@@ -31,6 +32,9 @@ class Byd extends utils.Adapter {
         this.unsupportedEndpoints = {}; // { vin: Set(['energy', 'hvac', 'charging']) }
         // Cache realtime data for fallback
         this.realtimeCache = {}; // { vin: {...} }
+        // MQTT client for push notifications
+        this.mqttClient = null;
+        this.mqttBroker = null;
 
         const jar = new CookieJar();
         this.requestClient = wrapper(
@@ -68,6 +72,7 @@ class Byd extends utils.Adapter {
 
         await this.getVehicleList();
         await this.updateVehicles();
+        await this.connectMqtt();
 
         this.updateInterval = setInterval(() => {
             this.updateVehicles();
@@ -706,6 +711,165 @@ class Byd extends utils.Adapter {
             });
     }
 
+    async connectMqtt() {
+        if (!this.session) {
+            return;
+        }
+
+        // Fetch MQTT broker address
+        const req = bydapi.buildEmqBrokerRequest(
+            this.session,
+            this.config.countryCode,
+            this.config.language,
+            this.deviceConfig,
+        );
+
+        await this.requestClient({
+            method: 'post',
+            url: `${bydapi.BASE_URL}/app/emqAuth/getEmqBrokerIp`,
+            headers: {
+                'User-Agent': bydapi.USER_AGENT,
+                'Content-Type': 'application/json; charset=UTF-8',
+            },
+            data: { request: bydapi.encodeEnvelope(req.outer) },
+        })
+            .then(async res => {
+                this.log.debug(`EMQ broker response: ${JSON.stringify(res.data)}`);
+                const decoded = bydapi.decodeEnvelope(res.data);
+
+                if (decoded.code !== '0') {
+                    this.log.error(`EMQ broker lookup failed: code=${decoded.code} message=${decoded.message || ''}`);
+                    return;
+                }
+
+                const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
+                // Response contains emqBorker (typo in API) or emqBroker
+                this.mqttBroker = data.emqBorker || data.emqBroker;
+                this.log.debug(`MQTT broker: ${this.mqttBroker}`);
+            })
+            .catch(error => {
+                this.log.error(`EMQ broker error: ${error.message}`);
+            });
+
+        if (!this.mqttBroker) {
+            this.log.warn('Could not get MQTT broker address');
+            return;
+        }
+
+        // Build MQTT credentials
+        const clientId = bydapi.buildMqttClientId(this.deviceConfig.imeiMd5);
+        const tsSeconds = Math.floor(Date.now() / 1000);
+        const mqttPassword = bydapi.buildMqttPassword(this.session, clientId, tsSeconds);
+        const topic = `oversea/res/${this.session.userId}`;
+
+        this.log.info(`Connecting to MQTT broker: ${this.mqttBroker}`);
+
+        // Connect to MQTT broker
+        this.mqttClient = mqtt.connect(`mqtts://${this.mqttBroker}`, {
+            clientId,
+            username: this.session.userId,
+            password: mqttPassword,
+            protocolVersion: 5,
+            rejectUnauthorized: true,
+            reconnectPeriod: 30000,
+            connectTimeout: 30000,
+        });
+
+        this.mqttClient.on('connect', () => {
+            this.log.info('MQTT connected');
+            this.mqttClient.subscribe(topic, { qos: 1 }, err => {
+                if (err) {
+                    this.log.error(`MQTT subscribe error: ${err.message}`);
+                } else {
+                    this.log.info(`MQTT subscribed to: ${topic}`);
+                }
+            });
+        });
+
+        this.mqttClient.on('message', (msgTopic, message) => {
+            this.handleMqttMessage(msgTopic, message);
+        });
+
+        this.mqttClient.on('error', err => {
+            this.log.error(`MQTT error: ${err.message}`);
+        });
+
+        this.mqttClient.on('close', () => {
+            this.log.debug('MQTT connection closed');
+        });
+
+        this.mqttClient.on('reconnect', () => {
+            this.log.debug('MQTT reconnecting...');
+            // Update password on reconnect (timestamp changes)
+            const newTsSeconds = Math.floor(Date.now() / 1000);
+            const newPassword = bydapi.buildMqttPassword(this.session, clientId, newTsSeconds);
+            this.mqttClient.options.password = newPassword;
+        });
+    }
+
+    handleMqttMessage(topic, message) {
+        try {
+            const messageStr = message.toString();
+            this.log.debug(`MQTT message on ${topic}: ${messageStr}`);
+
+            // Try to parse as JSON
+            let payload;
+            try {
+                payload = JSON.parse(messageStr);
+            } catch {
+                // Message might be encrypted hex string
+                if (/^[0-9A-Fa-f]+$/.test(messageStr) && this.session?.encryToken) {
+                    const decrypted = bydapi.decryptMqttPayload(messageStr, this.session.encryToken);
+                    payload = JSON.parse(decrypted);
+                    this.log.debug(`MQTT decrypted: ${JSON.stringify(payload)}`);
+                } else {
+                    this.log.debug(`MQTT raw message: ${messageStr}`);
+                    return;
+                }
+            }
+
+            // Handle different message types
+            // Sample push messages:
+            // - Vehicle status update: { "vin": "...", "type": "vehicleStatus", "data": {...} }
+            // - Charging update: { "vin": "...", "type": "charging", "data": {...} }
+            // - Remote control result: { "vin": "...", "type": "remoteControl", "data": {...} }
+            if (payload.vin) {
+                const vin = payload.vin;
+                const id = vin.toString().replace(this.FORBIDDEN_CHARS, '_');
+
+                if (payload.data) {
+                    this.log.info(`MQTT push update for ${vin}: type=${payload.type || 'unknown'}`);
+                    this.json2iob.parse(`${id}.mqtt`, payload.data, {
+                        forceIndex: true,
+                        descriptions,
+                        states,
+                    });
+
+                    // If it's a vehicle status update, also update main states
+                    if (payload.type === 'vehicleStatus' || !payload.type) {
+                        this.json2iob.parse(id, payload.data, {
+                            forceIndex: true,
+                            descriptions,
+                            states,
+                        });
+                    }
+                } else {
+                    // Direct data without wrapper
+                    this.json2iob.parse(`${id}.mqtt`, payload, {
+                        forceIndex: true,
+                        descriptions,
+                        states,
+                    });
+                }
+            } else {
+                // Generic message without VIN
+                this.log.info(`MQTT message: ${JSON.stringify(payload)}`);
+            }
+        } catch (error) {
+            this.log.error(`MQTT message handling error: ${error.message}`);
+        }
+    }
+
     async sendRemoteControl(vin, commandType, controlParamsMap = null) {
         if (!this.session) {
             return;
@@ -944,6 +1108,10 @@ class Byd extends utils.Adapter {
             this.setState('info.connection', false, true);
             this.updateInterval && clearInterval(this.updateInterval);
             this.refreshTimeout && clearTimeout(this.refreshTimeout);
+            if (this.mqttClient) {
+                this.mqttClient.end(true);
+                this.mqttClient = null;
+            }
             callback();
         } catch {
             callback();

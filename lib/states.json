@@ -126,5 +126,38 @@
   "bookingChargeState": {
     "0": "Off",
     "1": "Scheduled"
+  },
+  "bookingDepartureState": {
+    "0": "Off",
+    "1": "Scheduled"
+  },
+  "smartChargeState": {
+    "0": "Off",
+    "1": "Active"
+  },
+  "smartJourneyState": {
+    "0": "Off",
+    "1": "Active"
+  },
+  "safeCharge": {
+    "false": "Off",
+    "true": "On"
+  },
+  "batteryHeatStatus": {
+    "0": "Off",
+    "1": "On"
+  },
+  "airStats": {
+    "0": "Off",
+    "1": "On"
+  },
+  "batteryHeat": {
+    "0": "Off",
+    "1": "On"
+  },
+  "res": {
+    "0": "Pending",
+    "1": "Failure",
+    "2": "Success"
   }
 }
