@@ -6,6 +6,7 @@ const { wrapper } = require('axios-cookiejar-support');
 const { CookieJar } = require('tough-cookie');
 const Json2iob = require('json2iob');
 const bydapi = require('./lib/bydapi');
+const devicegen = require('./lib/devicegen');
 
 class Byd extends utils.Adapter {
     constructor(options) {
@@ -48,6 +49,9 @@ class Byd extends utils.Adapter {
             return;
         }
 
+        // Load or generate device fingerprint (persistent across restarts)
+        await this.loadOrGenerateDeviceConfig();
+
         this.subscribeStates('*');
 
         await this.login();
@@ -62,6 +66,38 @@ class Byd extends utils.Adapter {
         this.updateInterval = setInterval(() => {
             this.updateVehicles();
         }, this.config.interval * 1000);
+    }
+
+    async loadOrGenerateDeviceConfig() {
+        // Try to load existing device config from adapter state
+        const deviceState = await this.getStateAsync('info.deviceConfig');
+        if (deviceState && deviceState.val && typeof deviceState.val === 'string') {
+            try {
+                this.deviceConfig = JSON.parse(deviceState.val);
+                this.log.debug('Loaded existing device fingerprint');
+                return;
+            } catch {
+                this.log.warn('Failed to parse stored device config, generating new one');
+            }
+        }
+
+        // Generate new device fingerprint
+        this.deviceConfig = devicegen.generateDeviceProfile();
+        this.log.info(`Generated device: ${this.deviceConfig.model} (${this.deviceConfig.mobileBrand})`);
+
+        // Store for persistence
+        await this.setObjectNotExistsAsync('info.deviceConfig', {
+            type: 'state',
+            common: {
+                name: 'Device Fingerprint',
+                type: 'string',
+                role: 'json',
+                read: true,
+                write: false,
+            },
+            native: {},
+        });
+        await this.setStateAsync('info.deviceConfig', JSON.stringify(this.deviceConfig), true);
     }
 
     async login() {

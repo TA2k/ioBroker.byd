@@ -1,0 +1,92 @@
+[
+  {
+    "model": "SM-S928B",
+    "mod": "samsung",
+    "mobile_brand": "samsung",
+    "mobile_model": "Galaxy S24 Ultra",
+    "tac_prefix": "35847512",
+    "sdk_options": ["34", "35"],
+    "os_options": ["14", "15"]
+  },
+  {
+    "model": "SM-S911B",
+    "mod": "samsung",
+    "mobile_brand": "samsung",
+    "mobile_model": "Galaxy S23",
+    "tac_prefix": "35294712",
+    "sdk_options": ["33", "34", "35"],
+    "os_options": ["13", "14", "15"]
+  },
+  {
+    "model": "Pixel 8 Pro",
+    "mod": "Google",
+    "mobile_brand": "Google",
+    "mobile_model": "Pixel 8 Pro",
+    "tac_prefix": "35396012",
+    "sdk_options": ["34", "35"],
+    "os_options": ["14", "15"]
+  },
+  {
+    "model": "Pixel 7",
+    "mod": "Google",
+    "mobile_brand": "Google",
+    "mobile_model": "Pixel 7",
+    "tac_prefix": "35396011",
+    "sdk_options": ["33", "34", "35"],
+    "os_options": ["13", "14", "15"]
+  },
+  {
+    "model": "2201116SG",
+    "mod": "Xiaomi",
+    "mobile_brand": "Xiaomi",
+    "mobile_model": "12 Pro",
+    "tac_prefix": "86478003",
+    "sdk_options": ["33", "34"],
+    "os_options": ["13", "14"]
+  },
+  {
+    "model": "23127PN0CC",
+    "mod": "Xiaomi",
+    "mobile_brand": "Xiaomi",
+    "mobile_model": "14",
+    "tac_prefix": "86758004",
+    "sdk_options": ["34", "35"],
+    "os_options": ["14", "15"]
+  },
+  {
+    "model": "CPH2451",
+    "mod": "OnePlus",
+    "mobile_brand": "OnePlus",
+    "mobile_model": "11",
+    "tac_prefix": "86543903",
+    "sdk_options": ["33", "34"],
+    "os_options": ["13", "14"]
+  },
+  {
+    "model": "LE2121",
+    "mod": "OnePlus",
+    "mobile_brand": "OnePlus",
+    "mobile_model": "9 Pro",
+    "tac_prefix": "86854703",
+    "sdk_options": ["33", "34"],
+    "os_options": ["13", "14"]
+  },
+  {
+    "model": "VOG-L29",
+    "mod": "HUAWEI",
+    "mobile_brand": "HUAWEI",
+    "mobile_model": "P30 Pro",
+    "tac_prefix": "86069604",
+    "sdk_options": ["31", "32"],
+    "os_options": ["12", "12"]
+  },
+  {
+    "model": "POCO F1",
+    "mod": "Xiaomi",
+    "mobile_brand": "XIAOMI",
+    "mobile_model": "POCO F1",
+    "tac_prefix": "86478001",
+    "sdk_options": ["33", "34", "35"],
+    "os_options": ["13", "14", "15"]
+  }
+]
