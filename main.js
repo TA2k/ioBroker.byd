@@ -782,7 +782,7 @@ class Byd extends utils.Adapter {
         const clientId = bydapi.buildMqttClientId(this.deviceConfig.imeiMd5);
         const tsSeconds = Math.floor(Date.now() / 1000);
         const mqttPassword = bydapi.buildMqttPassword(this.session, clientId, tsSeconds);
-        const topic = `oversea/res/${this.session.userId}`;
+        const topic = `/oversea/res/${this.session.userId}`;
 
         this.log.info(`Connecting to MQTT broker: ${this.mqttBroker}`);
 
