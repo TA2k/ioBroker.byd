@@ -907,23 +907,32 @@ class Byd extends utils.Adapter {
 
     handleMqttMessage(topic, message) {
         try {
-            const messageStr = message.toString();
+            // MQTT messages from BYD are always AES encrypted hex strings
+            // Convert buffer to ASCII string (like pyBYD does)
+            const messageStr = message.toString('ascii').trim();
             this.log.debug(`MQTT message on ${topic}: ${messageStr}`);
 
-            // Try to parse as JSON, otherwise decrypt if hex-encoded
+            if (!this.session?.encryToken) {
+                this.log.debug('MQTT message received but no session - skipping');
+                return;
+            }
+
+            // All BYD MQTT messages should be hex-encoded encrypted data
+            if (!/^[0-9A-Fa-f]+$/.test(messageStr)) {
+                this.log.debug(`MQTT message is not hex - skipping (BYD messages are always encrypted)`);
+                return;
+            }
+
+            // Decrypt the hex-encoded message
             let payload;
             try {
-                payload = JSON.parse(messageStr);
-            } catch {
-                // Message might be encrypted hex string
-                if (/^[0-9A-Fa-f]+$/.test(messageStr) && this.session?.encryToken) {
-                    const decrypted = bydapi.decryptMqttPayload(messageStr, this.session.encryToken);
-                    payload = JSON.parse(decrypted);
-                    this.log.debug(`MQTT decrypted: ${JSON.stringify(payload)}`);
-                } else {
-                    this.log.debug(`MQTT raw message: ${messageStr}`);
-                    return;
-                }
+                const decrypted = bydapi.decryptMqttPayload(messageStr, this.session.encryToken);
+                payload = JSON.parse(decrypted);
+                this.log.debug(`MQTT decrypted: ${JSON.stringify(payload)}`);
+            } catch (decryptErr) {
+                // Decryption failed - token might be stale or wrong format
+                this.log.debug(`MQTT decrypt failed (${decryptErr.message}), skipping`);
+                return;
             }
 
             // pyBYD event types: "vehicleInfo", "remoteControl"
@@ -1178,14 +1187,21 @@ class Byd extends utils.Adapter {
             }
 
             if (decoded.respondData) {
-                const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
-                this.log.debug(`Control password verification result: ${JSON.stringify(data)}`);
-                if (data.ok === true) {
-                    this.log.info('Control password verified successfully');
-                    return { success: true };
+                try {
+                    const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
+                    this.log.debug(`Control password verification result: ${JSON.stringify(data)}`);
+                    if (data.ok === true) {
+                        this.log.info('Control password verified successfully');
+                        return { success: true };
+                    }
+                } catch (decryptErr) {
+                    this.log.warn(`Control password response decryption failed: ${decryptErr.message}`);
+                    // Response exists but couldn't be decrypted - treat as success since code=0
                 }
             }
 
+            // code=0 means API accepted the request
+            this.log.info('Control password verified (code=0)');
             return { success: true };
         } catch (error) {
             this.log.error(`Control password verification error: ${error.message}`);
