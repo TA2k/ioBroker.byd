@@ -87,7 +87,8 @@ class Byd extends utils.Adapter {
                 }
             }
         } else if (!this.config.controlPin) {
-            this.log.info('No control PIN configured - some remote commands may require a PIN');
+            this.log.warn('No control PIN configured in ioBroker adapter settings');
+            this.log.warn('Remote control commands require a PIN (same as in BYD app)');
         }
 
         // Initial data fetch via HTTP (once at startup)
@@ -109,64 +110,41 @@ class Byd extends utils.Adapter {
     }
 
     async loadOrGenerateDeviceConfig() {
-        // Delete old deviceConfig state (had version stored, causing issues on updates)
-        try {
-            await this.delObjectAsync('info.deviceConfig');
-        } catch {
-            // Ignore if doesn't exist
-        }
+        // Try to load existing device fingerprint from adapter state
+        const fpState = await this.getStateAsync('info.deviceFingerprint');
+        let fingerprint = null;
 
-        // Try to load existing device identity from adapter state (without version info)
-        const deviceState = await this.getStateAsync('info.deviceIdentity');
-        if (deviceState && deviceState.val && typeof deviceState.val === 'string') {
+        if (fpState && fpState.val && typeof fpState.val === 'string') {
             try {
-                const storedIdentity = JSON.parse(deviceState.val);
-                // Merge stored identity with current dynamic config (appVersion, etc.)
-                this.deviceConfig = {
-                    ...devicegen.generateDeviceProfile(), // Get current version fields
-                    ...storedIdentity, // Override with stored identity fields
-                };
-                this.log.debug('Loaded existing device identity, using current app version');
-                return;
+                fingerprint = JSON.parse(fpState.val);
+                this.log.debug('Loaded existing device fingerprint');
             } catch {
-                this.log.warn('Failed to parse stored device identity, generating new one');
+                this.log.warn('Failed to parse stored fingerprint, generating new one');
             }
         }
 
-        // Generate new device fingerprint
-        this.deviceConfig = devicegen.generateDeviceProfile();
-        this.log.info(`Generated device: ${this.deviceConfig.model} (${this.deviceConfig.mobileBrand})`);
+        if (!fingerprint) {
+            // Generate new device fingerprint (without app version fields)
+            fingerprint = devicegen.generateDeviceProfile();
+            this.log.info(`Generated device: ${fingerprint.model} (${fingerprint.mobileBrand})`);
 
-        // Store only identity fields (not version) for persistence
-        const identityFields = {
-            ostype: this.deviceConfig.ostype,
-            imei: this.deviceConfig.imei,
-            mac: this.deviceConfig.mac,
-            model: this.deviceConfig.model,
-            sdk: this.deviceConfig.sdk,
-            mod: this.deviceConfig.mod,
-            imeiMd5: this.deviceConfig.imeiMd5,
-            mobileBrand: this.deviceConfig.mobileBrand,
-            mobileModel: this.deviceConfig.mobileModel,
-            deviceType: this.deviceConfig.deviceType,
-            networkType: this.deviceConfig.networkType,
-            osType: this.deviceConfig.osType,
-            osVersion: this.deviceConfig.osVersion,
-            deviceName: this.deviceConfig.deviceName,
-        };
+            // Store fingerprint (only static device data, no app version)
+            await this.setObjectNotExistsAsync('info.deviceFingerprint', {
+                type: 'state',
+                common: {
+                    name: 'Device Fingerprint',
+                    type: 'string',
+                    role: 'json',
+                    read: true,
+                    write: false,
+                },
+                native: {},
+            });
+            await this.setStateAsync('info.deviceFingerprint', JSON.stringify(fingerprint), true);
+        }
 
-        await this.setObjectNotExistsAsync('info.deviceIdentity', {
-            type: 'state',
-            common: {
-                name: 'Device Identity (without version)',
-                type: 'string',
-                role: 'json',
-                read: true,
-                write: false,
-            },
-            native: {},
-        });
-        await this.setStateAsync('info.deviceIdentity', JSON.stringify(identityFields), true);
+        // Add dynamic app fields (version, timezone etc.) - not persisted
+        this.deviceConfig = devicegen.addAppFields(fingerprint);
     }
 
     async login() {
@@ -298,12 +276,51 @@ class Byd extends utils.Adapter {
                     const id = vin.toString().replace(this.FORBIDDEN_CHARS, '_');
                     this.vehicleArray.push(vehicle);
 
+                    // Device name: Model + Plate (e.g. "BYD SEALION 7 - KO591ET")
+                    const modelName = vehicle.modelName || vehicle.autoAlias || 'BYD';
+                    const plate = vehicle.autoPlate || '';
+                    const deviceName = plate ? `${modelName} - ${plate}` : modelName;
+
                     await this.extendObject(id, {
                         type: 'device',
-                        common: { name: vehicle.carSeriesName || vehicle.vin },
+                        common: { name: deviceName },
                         native: {},
                     });
 
+                    // Channel: general - static vehicle information
+                    await this.setObjectNotExistsAsync(`${id}.general`, {
+                        type: 'channel',
+                        common: { name: 'General Information' },
+                        native: {},
+                    });
+
+                    // Parse static vehicle data into general channel
+                    const generalData = {
+                        vin: vehicle.vin,
+                        modelName: vehicle.modelName,
+                        brandName: vehicle.brandName,
+                        autoAlias: vehicle.autoAlias,
+                        autoPlate: vehicle.autoPlate,
+                        energyType: vehicle.energyType,
+                        tboxVersion: vehicle.tboxVersion,
+                        vehicleTimeZone: vehicle.vehicleTimeZone,
+                        autoBoughtTime: vehicle.autoBoughtTime,
+                        yunActiveTime: vehicle.yunActiveTime,
+                    };
+                    this.json2iob.parse(`${id}.general`, generalData, {
+                        forceIndex: true,
+                        descriptions,
+                        states,
+                    });
+
+                    // Channel: status - realtime data from API/MQTT
+                    await this.setObjectNotExistsAsync(`${id}.status`, {
+                        type: 'channel',
+                        common: { name: 'Vehicle Status' },
+                        native: {},
+                    });
+
+                    // Channel: remote - control commands
                     await this.setObjectNotExistsAsync(`${id}.remote`, {
                         type: 'channel',
                         common: { name: 'Remote Controls' },
@@ -311,15 +328,15 @@ class Byd extends utils.Adapter {
                     });
 
                     const remoteArray = [
-                        { command: 'refresh', name: 'True = Refresh' },
-                        { command: 'lock', name: 'True = Lock' },
-                        { command: 'unlock', name: 'True = Unlock' },
-                        { command: 'flash', name: 'True = Flash Lights (no horn)' },
-                        { command: 'findCar', name: 'True = Flash + Horn (find car)' },
-                        { command: 'closeWindows', name: 'True = Close Windows' },
-                        { command: 'climate', name: 'True = Start Climate, False = Stop Climate' },
-                        { command: 'seatHeat', name: 'True = Start Seat Heating, False = Stop' },
-                        { command: 'batteryHeat', name: 'True = Start Battery Heating, False = Stop' },
+                        { command: 'refresh', name: 'Refresh Data' },
+                        { command: 'lock', name: 'Lock Doors' },
+                        { command: 'unlock', name: 'Unlock Doors' },
+                        { command: 'flash', name: 'Flash Lights' },
+                        { command: 'findCar', name: 'Find Car (Flash + Horn)' },
+                        { command: 'closeWindows', name: 'Close Windows' },
+                        { command: 'climate', name: 'Climate Control' },
+                        { command: 'seatHeat', name: 'Seat Heating' },
+                        { command: 'batteryHeat', name: 'Battery Heating' },
                     ];
 
                     for (const remote of remoteArray) {
@@ -336,12 +353,6 @@ class Byd extends utils.Adapter {
                             native: {},
                         });
                     }
-
-                    this.json2iob.parse(id, vehicle, {
-                        forceIndex: true,
-                        descriptions,
-                        states,
-                    });
                 }
             })
             .catch(error => {
@@ -384,9 +395,7 @@ class Byd extends utils.Adapter {
 
         await this.pollVehicleRealtime(vin, objId);
         await this.pollGpsInfo(vin, objId);
-        await this.getEnergyConsumption(vin, objId);
-        await this.getHvacStatus(vin, objId);
-        await this.getChargingStatus(vin, objId);
+        await this.getVehicleStatusEndpoints(vin, objId);
     }
 
     /**
@@ -404,16 +413,41 @@ class Byd extends utils.Adapter {
         this.session = null;
         this.setState('info.connection', false, true);
         await this.login();
+        if (this.session) {
+            // Reconnect MQTT with new session tokens
+            this.reconnectMqtt();
+        }
         return !!this.session;
     }
 
-    async pollVehicleRealtime(vin, id) {
+    /**
+     * Reconnect MQTT with current session tokens.
+     * Called after re-login to update credentials.
+     */
+    reconnectMqtt() {
+        if (this.mqttClient) {
+            this.log.info('Reconnecting MQTT with new session tokens');
+            this.mqttClient.end(true);
+            this.mqttClient = null;
+        }
+        if (this.session && this.vehicleArray?.length > 0) {
+            this.connectMqtt();
+        }
+    }
+
+    /**
+     * Generic poll endpoint that triggers a request and polls for results
+     * @param {string} vin - Vehicle VIN
+     * @param {string} id - ioBroker object ID
+     * @param {object} endpoint - Endpoint config
+     */
+    async pollEndpoint(vin, id, endpoint) {
         if (!this.session) {
             return;
         }
 
-        // Trigger realtime data request
-        const triggerReq = bydapi.buildVehicleRealtimeRequest(
+        // Trigger request
+        const triggerReq = endpoint.builder(
             this.session,
             this.config.countryCode,
             this.config.language,
@@ -425,7 +459,7 @@ class Byd extends utils.Adapter {
 
         await this.requestClient({
             method: 'post',
-            url: `${bydapi.BASE_URL}/vehicleInfo/vehicle/vehicleRealTimeRequest`,
+            url: `${bydapi.BASE_URL}${endpoint.triggerUrl}`,
             headers: {
                 'User-Agent': bydapi.USER_AGENT,
                 'Content-Type': 'application/json; charset=UTF-8',
@@ -433,39 +467,22 @@ class Byd extends utils.Adapter {
             data: { request: bydapi.encodeEnvelope(triggerReq.outer) },
         })
             .then(async res => {
-                this.log.debug(`Realtime trigger response: ${JSON.stringify(res.data)}`);
+                this.log.debug(`${endpoint.name} trigger response: ${JSON.stringify(res.data)}`);
                 const decoded = bydapi.decodeEnvelope(res.data);
-                // Sample trigger response: { "requestSerial": "20250612000000000012345678" }
                 if (decoded.code === '0' && decoded.respondData) {
                     const data = bydapi.decryptResponseData(decoded.respondData, triggerReq.contentKey);
                     requestSerial = data.requestSerial || null;
                 }
             })
             .catch(error => {
-                this.log.error(`Realtime trigger error: ${error.message}`);
+                this.log.error(`${endpoint.name} trigger error: ${error.message}`);
             });
 
         // Poll for result (up to 10 attempts)
-        // Sample poll response:
-        // {
-        //   "requestSerial": "20250612000000000012345678", "vin": "LGXXXXXXXXXXX00000",
-        //   "soc": "75", "enduranceMileage": "320", "totalMileage": "13060",
-        //   "leftFrontTirepressure": "253", "rightFrontTirepressure": "250",
-        //   "leftRearTirepressure": "248", "rightRearTirepressure": "251",
-        //   "leftFrontDoorStatus": "2", "rightFrontDoorStatus": "2",
-        //   "leftRearDoorStatus": "2", "rightRearDoorStatus": "2",
-        //   "leftFrontWindowStatus": "2", "rightFrontWindowStatus": "2",
-        //   "leftRearWindowStatus": "2", "rightRearWindowStatus": "2",
-        //   "sunRoofStatus": "2", "engineSt": "0", "bonnetStatus": "2", "bootStatus": "2",
-        //   "doorLockStatus": "1", "chargeStatus": "0", "onlineState": "1",
-        //   "time": 1749732195000, "longitudeDone": "16.xxxxxx", "latitudeDone": "48.xxxxxx",
-        //   "altitude": "196", "heading": "123.45", "airState": "0", "airTemp": "0",
-        //   "remainChargingTime": "0", "timezoneOffset": "+02:00"
-        // }
         for (let attempt = 0; attempt < 10; attempt++) {
             await this.sleep(1500);
 
-            const pollReq = bydapi.buildVehicleRealtimeRequest(
+            const pollReq = endpoint.builder(
                 this.session,
                 this.config.countryCode,
                 this.config.language,
@@ -478,7 +495,7 @@ class Byd extends utils.Adapter {
 
             await this.requestClient({
                 method: 'post',
-                url: `${bydapi.BASE_URL}/vehicleInfo/vehicle/vehicleRealTimeResult`,
+                url: `${bydapi.BASE_URL}${endpoint.pollUrl}`,
                 headers: {
                     'User-Agent': bydapi.USER_AGENT,
                     'Content-Type': 'application/json; charset=UTF-8',
@@ -486,41 +503,85 @@ class Byd extends utils.Adapter {
                 data: { request: bydapi.encodeEnvelope(pollReq.outer) },
             })
                 .then(async res => {
-                    this.log.debug(`Realtime poll response: ${JSON.stringify(res.data)}`);
+                    this.log.debug(`${endpoint.name} poll response: ${JSON.stringify(res.data)}`);
                     const decoded = bydapi.decodeEnvelope(res.data);
                     if (decoded.code === '0' && decoded.respondData) {
                         const data = bydapi.decryptResponseData(decoded.respondData, pollReq.contentKey);
-                        this.log.debug(`Realtime data: ${JSON.stringify(data)}`);
+                        this.log.debug(`${endpoint.name} data: ${JSON.stringify(data)}`);
 
-                        if (bydapi.isRealtimeDataReady(data)) {
-                            // Cache realtime data for fallback (e.g. energy endpoint)
-                            this.realtimeCache[vin] = data;
-                            this.json2iob.parse(id, data, {
-                                forceIndex: true,
-                                descriptions,
-                                states,
-                            });
+                        if (endpoint.isReady(data)) {
+                            if (endpoint.cache) {
+                                this.realtimeCache[vin] = data;
+                            }
+                            const parseOpts = { forceIndex: true, descriptions, states };
+                            if (endpoint.channelName) {
+                                parseOpts.channelName = endpoint.channelName;
+                            }
+                            this.json2iob.parse(`${id}.status${endpoint.channel ? '.' + endpoint.channel : ''}`, data, parseOpts);
                             ready = true;
                         }
                     }
                 })
                 .catch(error => {
-                    this.log.error(`Realtime poll error: ${error.message}`);
+                    this.log.error(`${endpoint.name} poll error: ${error.message}`);
                 });
 
             if (ready) {
                 break;
             }
         }
+    }
+
+    async pollVehicleRealtime(vin, id) {
+        await this.pollEndpoint(vin, id, {
+            name: 'Realtime',
+            triggerUrl: '/vehicleInfo/vehicle/vehicleRealTimeRequest',
+            pollUrl: '/vehicleInfo/vehicle/vehicleRealTimeResult',
+            builder: bydapi.buildVehicleRealtimeRequest,
+            isReady: bydapi.isRealtimeDataReady,
+            cache: true,
+        });
     }
 
     async pollGpsInfo(vin, id) {
+        await this.pollEndpoint(vin, id, {
+            name: 'GPS',
+            triggerUrl: '/control/getGpsInfo',
+            pollUrl: '/control/getGpsInfoResult',
+            builder: bydapi.buildGpsInfoRequest,
+            isReady: bydapi.isGpsDataReady,
+            channel: 'gps',
+            channelName: 'GPS Location',
+        });
+    }
+
+    /**
+     * Fetch a status endpoint and parse into ioBroker states
+     * @param {string} vin - Vehicle VIN
+     * @param {string} id - ioBroker object ID
+     * @param {object} endpoint - Endpoint config { name, channel, url, builder, fallbackField }
+     */
+    async fetchStatusEndpoint(vin, id, endpoint) {
         if (!this.session) {
             return;
         }
 
-        // Trigger GPS request
-        const triggerReq = bydapi.buildGpsInfoRequest(
+        // Skip if endpoint is known to be unsupported for this VIN
+        if (this.unsupportedEndpoints[vin]?.has(endpoint.name)) {
+            // Use fallback if available
+            if (endpoint.fallbackField) {
+                const cached = this.realtimeCache[vin];
+                if (cached && cached[endpoint.fallbackField]) {
+                    this.json2iob.parse(`${id}.status.${endpoint.channel}`, {
+                        [endpoint.fallbackField]: cached[endpoint.fallbackField],
+                        _fallback: true,
+                    }, { forceIndex: true, descriptions, states });
+                }
+            }
+            return;
+        }
+
+        const req = endpoint.builder(
             this.session,
             this.config.countryCode,
             this.config.language,
@@ -528,284 +589,83 @@ class Byd extends utils.Adapter {
             vin,
         );
 
-        let requestSerial = null;
-
         await this.requestClient({
             method: 'post',
-            url: `${bydapi.BASE_URL}/control/getGpsInfo`,
+            url: `${bydapi.BASE_URL}${endpoint.url}`,
             headers: {
                 'User-Agent': bydapi.USER_AGENT,
                 'Content-Type': 'application/json; charset=UTF-8',
             },
-            data: { request: bydapi.encodeEnvelope(triggerReq.outer) },
+            data: { request: bydapi.encodeEnvelope(req.outer) },
         })
             .then(async res => {
-                this.log.debug(`GPS trigger response: ${JSON.stringify(res.data)}`);
+                this.log.debug(`${endpoint.name} response: ${JSON.stringify(res.data)}`);
                 const decoded = bydapi.decodeEnvelope(res.data);
-                // Sample trigger response: { "requestSerial": "20250612000000000012345678" }
+
                 if (decoded.code === '0' && decoded.respondData) {
-                    const data = bydapi.decryptResponseData(decoded.respondData, triggerReq.contentKey);
-                    requestSerial = data.requestSerial || null;
-                }
-            })
-            .catch(error => {
-                this.log.error(`GPS trigger error: ${error.message}`);
-            });
+                    const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
+                    this.log.debug(`${endpoint.name} data: ${JSON.stringify(data)}`);
+                    this.json2iob.parse(`${id}.status.${endpoint.channel}`, data, {
+                        forceIndex: true,
+                        channelName: endpoint.channelName,
+                        descriptions,
+                        states,
+                    });
+                } else if (bydapi.isSessionExpired(decoded.code)) {
+                    await this.handleSessionExpired(decoded.code, endpoint.name);
+                } else if (bydapi.isEndpointNotSupported(decoded.code)) {
+                    this.log.info(`${endpoint.name} endpoint not supported for ${vin}`);
+                    if (!this.unsupportedEndpoints[vin]) {
+                        this.unsupportedEndpoints[vin] = new Set();
+                    }
+                    this.unsupportedEndpoints[vin].add(endpoint.name);
 
-        // Poll for result (up to 10 attempts)
-        // Sample poll response:
-        // {
-        //   "requestSerial": "20250612000000000012345678",
-        //   "longitudeDone": "16.xxxxxx", "latitudeDone": "48.xxxxxx",
-        //   "altitude": "196", "speed": "0", "heading": "123.45",
-        //   "time": 1749732195000, "gpsState": "1"
-        // }
-        for (let attempt = 0; attempt < 10; attempt++) {
-            await this.sleep(1500);
-
-            const pollReq = bydapi.buildGpsInfoRequest(
-                this.session,
-                this.config.countryCode,
-                this.config.language,
-                this.deviceConfig,
-                vin,
-                requestSerial,
-            );
-
-            let ready = false;
-
-            await this.requestClient({
-                method: 'post',
-                url: `${bydapi.BASE_URL}/control/getGpsInfoResult`,
-                headers: {
-                    'User-Agent': bydapi.USER_AGENT,
-                    'Content-Type': 'application/json; charset=UTF-8',
-                },
-                data: { request: bydapi.encodeEnvelope(pollReq.outer) },
-            })
-                .then(async res => {
-                    this.log.debug(`GPS poll response: ${JSON.stringify(res.data)}`);
-                    const decoded = bydapi.decodeEnvelope(res.data);
-                    if (decoded.code === '0' && decoded.respondData) {
-                        const data = bydapi.decryptResponseData(decoded.respondData, pollReq.contentKey);
-                        this.log.debug(`GPS data: ${JSON.stringify(data)}`);
-
-                        if (bydapi.isGpsDataReady(data)) {
-                            this.json2iob.parse(`${id}.gps`, data, {
-                                forceIndex: true,
-                                descriptions,
-                                states,
-                            });
-                            ready = true;
+                    // Use fallback if available
+                    if (endpoint.fallbackField) {
+                        const cached = this.realtimeCache[vin];
+                        if (cached && cached[endpoint.fallbackField]) {
+                            this.json2iob.parse(`${id}.status.${endpoint.channel}`, {
+                                [endpoint.fallbackField]: cached[endpoint.fallbackField],
+                                _fallback: true,
+                            }, { forceIndex: true, descriptions, states });
                         }
                     }
-                })
-                .catch(error => {
-                    this.log.error(`GPS poll error: ${error.message}`);
-                });
-
-            if (ready) {
-                break;
-            }
-        }
-    }
-
-    async getEnergyConsumption(vin, id) {
-        if (!this.session) {
-            return;
-        }
-
-        // Skip if endpoint is known to be unsupported for this VIN
-        if (this.unsupportedEndpoints[vin]?.has('energy')) {
-            // Use fallback from realtime cache
-            const cached = this.realtimeCache[vin];
-            if (cached && cached.totalEnergy) {
-                const fallbackData = {
-                    totalEnergy: cached.totalEnergy,
-                    _fallback: true,
-                };
-                this.json2iob.parse(`${id}.energy`, fallbackData, {
-                    forceIndex: true,
-                    descriptions,
-                    states,
-                });
-            }
-            return;
-        }
-
-        const req = bydapi.buildEnergyConsumptionRequest(
-            this.session,
-            this.config.countryCode,
-            this.config.language,
-            this.deviceConfig,
-            vin,
-        );
-
-        await this.requestClient({
-            method: 'post',
-            url: `${bydapi.BASE_URL}/vehicleInfo/vehicle/getEnergyConsumption`,
-            headers: {
-                'User-Agent': bydapi.USER_AGENT,
-                'Content-Type': 'application/json; charset=UTF-8',
-            },
-            data: { request: bydapi.encodeEnvelope(req.outer) },
-        })
-            .then(async res => {
-                this.log.debug(`Energy consumption response: ${JSON.stringify(res.data)}`);
-                const decoded = bydapi.decodeEnvelope(res.data);
-                // Sample response:
-                // {
-                //   "avgConsumption": "18.5", "avgConsumptionUnit": "kWh/100km",
-                //   "totalConsumption": "2405.2", "totalConsumptionUnit": "kWh",
-                //   "dailyList": [{ "date": "2025-02-10", "consumption": "12.3" }, ...]
-                // }
-                if (decoded.code === '0' && decoded.respondData) {
-                    const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
-                    this.log.debug(`Energy consumption data: ${JSON.stringify(data)}`);
-                    this.json2iob.parse(`${id}.energy`, data, {
-                        forceIndex: true,
-                        descriptions,
-                        states,
-                    });
-                } else if (bydapi.isSessionExpired(decoded.code)) {
-                    await this.handleSessionExpired(decoded.code, 'getEnergyConsumption');
-                } else if (bydapi.isEndpointNotSupported(decoded.code)) {
-                    // Endpoint not supported for this vehicle - remember and use fallback
-                    this.log.info(`Energy endpoint not supported for ${vin} - using realtime fallback`);
-                    if (!this.unsupportedEndpoints[vin]) {
-                        this.unsupportedEndpoints[vin] = new Set();
-                    }
-                    this.unsupportedEndpoints[vin].add('energy');
-                    // Use fallback from realtime cache
-                    const cached = this.realtimeCache[vin];
-                    if (cached && cached.totalEnergy) {
-                        const fallbackData = {
-                            totalEnergy: cached.totalEnergy,
-                            _fallback: true,
-                        };
-                        this.json2iob.parse(`${id}.energy`, fallbackData, {
-                            forceIndex: true,
-                            descriptions,
-                            states,
-                        });
-                    }
                 }
             })
             .catch(error => {
-                this.log.error(`Energy consumption error: ${error.message}`);
+                this.log.error(`${endpoint.name} error: ${error.message}`);
             });
     }
 
-    async getHvacStatus(vin, id) {
-        if (!this.session) {
-            return;
-        }
-
-        // Skip if endpoint is known to be unsupported for this VIN
-        if (this.unsupportedEndpoints[vin]?.has('hvac')) {
-            return;
-        }
-
-        const req = bydapi.buildHvacStatusRequest(
-            this.session,
-            this.config.countryCode,
-            this.config.language,
-            this.deviceConfig,
-            vin,
-        );
-
-        await this.requestClient({
-            method: 'post',
-            url: `${bydapi.BASE_URL}/control/getStatusNow`,
-            headers: {
-                'User-Agent': bydapi.USER_AGENT,
-                'Content-Type': 'application/json; charset=UTF-8',
+    async getVehicleStatusEndpoints(vin, id) {
+        const endpoints = [
+            {
+                name: 'energy',
+                channel: 'energy',
+                channelName: 'Energy Consumption',
+                url: '/vehicleInfo/vehicle/getEnergyConsumption',
+                builder: bydapi.buildEnergyConsumptionRequest,
+                fallbackField: 'totalEnergy',
             },
-            data: { request: bydapi.encodeEnvelope(req.outer) },
-        })
-            .then(async res => {
-                this.log.debug(`HVAC status response: ${JSON.stringify(res.data)}`);
-                const decoded = bydapi.decodeEnvelope(res.data);
-                // Sample response:
-                // { "airState": "0", "airTemp": "22", "mainSeatHeat": "0", "steeringWheelHeat": "0" }
-                if (decoded.code === '0' && decoded.respondData) {
-                    const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
-                    this.log.debug(`HVAC status data: ${JSON.stringify(data)}`);
-                    this.json2iob.parse(`${id}.hvac`, data, {
-                        forceIndex: true,
-                        descriptions,
-                        states,
-                    });
-                } else if (bydapi.isSessionExpired(decoded.code)) {
-                    await this.handleSessionExpired(decoded.code, 'getHvacStatus');
-                } else if (bydapi.isEndpointNotSupported(decoded.code)) {
-                    // Endpoint not supported for this vehicle
-                    this.log.info(`HVAC endpoint not supported for ${vin}`);
-                    if (!this.unsupportedEndpoints[vin]) {
-                        this.unsupportedEndpoints[vin] = new Set();
-                    }
-                    this.unsupportedEndpoints[vin].add('hvac');
-                }
-            })
-            .catch(error => {
-                this.log.error(`HVAC status error: ${error.message}`);
-            });
-    }
-
-    async getChargingStatus(vin, id) {
-        if (!this.session) {
-            return;
-        }
-
-        // Skip if endpoint is known to be unsupported for this VIN
-        if (this.unsupportedEndpoints[vin]?.has('charging')) {
-            return;
-        }
-
-        const req = bydapi.buildChargingStatusRequest(
-            this.session,
-            this.config.countryCode,
-            this.config.language,
-            this.deviceConfig,
-            vin,
-        );
-
-        await this.requestClient({
-            method: 'post',
-            url: `${bydapi.BASE_URL}/control/smartCharge/homePage`,
-            headers: {
-                'User-Agent': bydapi.USER_AGENT,
-                'Content-Type': 'application/json; charset=UTF-8',
+            {
+                name: 'hvac',
+                channel: 'hvac',
+                channelName: 'Climate Control',
+                url: '/control/getStatusNow',
+                builder: bydapi.buildHvacStatusRequest,
             },
-            data: { request: bydapi.encodeEnvelope(req.outer) },
-        })
-            .then(async res => {
-                this.log.debug(`Charging status response: ${JSON.stringify(res.data)}`);
-                const decoded = bydapi.decodeEnvelope(res.data);
-                // Sample response:
-                // { "soc": "75", "chargeStatus": "0", "remainChargingTime": "0", "chargingPower": "0" }
-                if (decoded.code === '0' && decoded.respondData) {
-                    const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
-                    this.log.debug(`Charging status data: ${JSON.stringify(data)}`);
-                    this.json2iob.parse(`${id}.charging`, data, {
-                        forceIndex: true,
-                        descriptions,
-                        states,
-                    });
-                } else if (bydapi.isSessionExpired(decoded.code)) {
-                    await this.handleSessionExpired(decoded.code, 'getChargingStatus');
-                } else if (bydapi.isEndpointNotSupported(decoded.code)) {
-                    // Endpoint not supported for this vehicle
-                    this.log.info(`Charging endpoint not supported for ${vin}`);
-                    if (!this.unsupportedEndpoints[vin]) {
-                        this.unsupportedEndpoints[vin] = new Set();
-                    }
-                    this.unsupportedEndpoints[vin].add('charging');
-                }
-            })
-            .catch(error => {
-                this.log.error(`Charging status error: ${error.message}`);
-            });
+            {
+                name: 'charging',
+                channel: 'charging',
+                channelName: 'Charging Status',
+                url: '/control/smartCharge/homePage',
+                builder: bydapi.buildChargingStatusRequest,
+            },
+        ];
+
+        for (const endpoint of endpoints) {
+            await this.fetchStatusEndpoint(vin, id, endpoint);
+        }
     }
 
     async connectMqtt() {
@@ -906,32 +766,23 @@ class Byd extends utils.Adapter {
 
     handleMqttMessage(topic, message) {
         try {
-            // MQTT messages from BYD are always AES encrypted hex strings
-            // Convert buffer to ASCII string (like pyBYD does)
-            const messageStr = message.toString('ascii').trim();
+            const messageStr = message.toString();
             this.log.debug(`MQTT message on ${topic}: ${messageStr}`);
 
-            if (!this.session?.encryToken) {
-                this.log.debug('MQTT message received but no session - skipping');
-                return;
-            }
-
-            // All BYD MQTT messages should be hex-encoded encrypted data
-            if (!/^[0-9A-Fa-f]+$/.test(messageStr)) {
-                this.log.debug(`MQTT message is not hex - skipping (BYD messages are always encrypted)`);
-                return;
-            }
-
-            // Decrypt the hex-encoded message
+            // Try to parse as JSON, otherwise decrypt if hex-encoded
             let payload;
             try {
-                const decrypted = bydapi.decryptMqttPayload(messageStr, this.session.encryToken);
-                payload = JSON.parse(decrypted);
-                this.log.debug(`MQTT decrypted: ${JSON.stringify(payload)}`);
-            } catch (decryptErr) {
-                // Decryption failed - token might be stale or wrong format
-                this.log.debug(`MQTT decrypt failed (${decryptErr.message}), skipping`);
-                return;
+                payload = JSON.parse(messageStr);
+            } catch {
+                // Message might be encrypted hex string
+                if (/^[0-9A-Fa-f]+$/.test(messageStr) && this.session?.encryToken) {
+                    const decrypted = bydapi.decryptMqttPayload(messageStr, this.session.encryToken);
+                    payload = JSON.parse(decrypted);
+                    this.log.debug(`MQTT decrypted: ${JSON.stringify(payload)}`);
+                } else {
+                    this.log.debug(`MQTT raw message: ${messageStr}`);
+                    return;
+                }
             }
 
             // pyBYD event types: "vehicleInfo", "remoteControl"
@@ -956,7 +807,7 @@ class Byd extends utils.Adapter {
                 // Generic data update with wrapper
                 this.log.info(`MQTT update for ${vin}: type=${eventType || 'unknown'}`);
                 const respondData = payload.data?.respondData || payload.data;
-                this.json2iob.parse(`${id}.mqtt`, respondData, {
+                this.json2iob.parse(`${id}.status.mqtt`, respondData, {
                     forceIndex: true,
                     descriptions,
                     states,
@@ -964,7 +815,7 @@ class Byd extends utils.Adapter {
             } else {
                 // Direct data without wrapper
                 this.log.debug(`MQTT generic message for ${vin}`);
-                this.json2iob.parse(`${id}.mqtt`, payload, {
+                this.json2iob.parse(`${id}.status.mqtt`, payload, {
                     forceIndex: true,
                     descriptions,
                     states,
@@ -999,15 +850,8 @@ class Byd extends utils.Adapter {
             _mqttTimestamp: Date.now(),
         };
 
-        // Parse into main vehicle states (like HTTP realtime data)
-        this.json2iob.parse(id, respondData, {
-            forceIndex: true,
-            descriptions,
-            states,
-        });
-
-        // Also store raw MQTT data
-        this.json2iob.parse(`${id}.mqtt.vehicleInfo`, respondData, {
+        // Parse into status channel (like HTTP realtime data)
+        this.json2iob.parse(`${id}.status`, respondData, {
             forceIndex: true,
             descriptions,
             states,
@@ -1076,7 +920,7 @@ class Byd extends utils.Adapter {
         }
 
         // Store control result
-        this.json2iob.parse(`${id}.mqtt.remoteControl`, respondData, {
+        this.json2iob.parse(`${id}.status.mqtt.remoteControl`, respondData, {
             forceIndex: true,
             descriptions,
             states,
@@ -1186,21 +1030,14 @@ class Byd extends utils.Adapter {
             }
 
             if (decoded.respondData) {
-                try {
-                    const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
-                    this.log.debug(`Control password verification result: ${JSON.stringify(data)}`);
-                    if (data.ok === true) {
-                        this.log.info('Control password verified successfully');
-                        return { success: true };
-                    }
-                } catch (decryptErr) {
-                    this.log.warn(`Control password response decryption failed: ${decryptErr.message}`);
-                    // Response exists but couldn't be decrypted - treat as success since code=0
+                const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
+                this.log.debug(`Control password verification result: ${JSON.stringify(data)}`);
+                if (data.ok === true) {
+                    this.log.info('Control password verified successfully');
+                    return { success: true };
                 }
             }
 
-            // code=0 means API accepted the request
-            this.log.info('Control password verified (code=0)');
             return { success: true };
         } catch (error) {
             this.log.error(`Control password verification error: ${error.message}`);
@@ -1385,11 +1222,6 @@ class Byd extends utils.Adapter {
                         return this.sendRemoteControl(vin, commandType, controlParamsMap, retryCount + 1);
                     }
                     return { success: false, error: 'Session expired' };
-                }
-
-                if (bydapi.isRemoteControlServiceError(decoded.code)) {
-                    this.log.warn('Remote control service error (1009) - vehicle offline or T-Box not responding');
-                    return { success: false, error: 'Vehicle offline or service unavailable' };
                 }
 
                 triggerError = `API error: ${decoded.code}`;
