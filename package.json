@@ -1,6 +1,6 @@
 {
   "name": "iobroker.byd",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "iobroker Adapter for BYD cars",
   "author": {
     "name": "TA2k",
@@ -19,27 +19,27 @@
     "url": "https://github.com/TA2k/ioBroker.byd.git"
   },
   "engines": {
-    "node": ">= 20"
+    "node": ">= 20.19.0"
   },
   "dependencies": {
     "@iobroker/adapter-core": "^3.3.2",
     "axios": "^1.13.5",
-    "axios-cookiejar-support": "^5.0.5",
+    "axios-cookiejar-support": "^6.0.5",
     "json2iob": "^2.6.22",
     "mqtt": "^5.15.0",
-    "tough-cookie": "^5.1.2"
+    "tough-cookie": "^6.0.0"
   },
   "devDependencies": {
-    "@alcalzone/release-script": "^5.0.0",
-    "@alcalzone/release-script-plugin-iobroker": "^4.0.0",
-    "@alcalzone/release-script-plugin-license": "^4.0.0",
-    "@alcalzone/release-script-plugin-manual-review": "^4.0.0",
+    "@alcalzone/release-script": "^5.1.1",
+    "@alcalzone/release-script-plugin-iobroker": "^5.1.1",
+    "@alcalzone/release-script-plugin-license": "^5.1.1",
+    "@alcalzone/release-script-plugin-manual-review": "^5.1.1",
     "@iobroker/adapter-dev": "^1.5.0",
     "@iobroker/eslint-config": "^2.2.0",
     "@iobroker/testing": "^5.2.2",
     "@tsconfig/node20": "^20.1.9",
     "@types/iobroker": "npm:@iobroker/types@^7.1.0",
-    "@types/node": "^20.19.33",
+    "@types/node": "^25.2.3",
     "typescript": "~5.9.3"
   },
   "main": "main.js",

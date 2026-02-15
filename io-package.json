@@ -1,9 +1,9 @@
 {
     "common": {
         "name": "byd",
-        "version": "0.0.1",
+        "version": "0.1.0",
         "news": {
-            "0.0.1": {
+            "0.1.0": {
                 "en": "initial release",
                 "de": "Erstveröffentlichung",
                 "ru": "Начальная версия",
@@ -22,7 +22,7 @@
             "de": "BYD",
             "ru": "БИД",
             "pt": "BYD",
-            "nl": "DOORD",
+            "nl": "BYD",
             "fr": "BYD",
             "it": "BYD",
             "es": "BYD",
