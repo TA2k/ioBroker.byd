@@ -110,15 +110,27 @@ class Byd extends utils.Adapter {
     }
 
     async loadOrGenerateDeviceConfig() {
-        // Try to load existing device config from adapter state
-        const deviceState = await this.getStateAsync('info.deviceConfig');
+        // Delete old deviceConfig state (had version stored, causing issues on updates)
+        try {
+            await this.delObjectAsync('info.deviceConfig');
+        } catch {
+            // Ignore if doesn't exist
+        }
+
+        // Try to load existing device identity from adapter state (without version info)
+        const deviceState = await this.getStateAsync('info.deviceIdentity');
         if (deviceState && deviceState.val && typeof deviceState.val === 'string') {
             try {
-                this.deviceConfig = JSON.parse(deviceState.val);
-                this.log.debug('Loaded existing device fingerprint');
+                const storedIdentity = JSON.parse(deviceState.val);
+                // Merge stored identity with current dynamic config (appVersion, etc.)
+                this.deviceConfig = {
+                    ...devicegen.generateDeviceProfile(), // Get current version fields
+                    ...storedIdentity, // Override with stored identity fields
+                };
+                this.log.debug('Loaded existing device identity, using current app version');
                 return;
             } catch {
-                this.log.warn('Failed to parse stored device config, generating new one');
+                this.log.warn('Failed to parse stored device identity, generating new one');
             }
         }
 
@@ -126,11 +138,28 @@ class Byd extends utils.Adapter {
         this.deviceConfig = devicegen.generateDeviceProfile();
         this.log.info(`Generated device: ${this.deviceConfig.model} (${this.deviceConfig.mobileBrand})`);
 
-        // Store for persistence
-        await this.setObjectNotExistsAsync('info.deviceConfig', {
+        // Store only identity fields (not version) for persistence
+        const identityFields = {
+            ostype: this.deviceConfig.ostype,
+            imei: this.deviceConfig.imei,
+            mac: this.deviceConfig.mac,
+            model: this.deviceConfig.model,
+            sdk: this.deviceConfig.sdk,
+            mod: this.deviceConfig.mod,
+            imeiMd5: this.deviceConfig.imeiMd5,
+            mobileBrand: this.deviceConfig.mobileBrand,
+            mobileModel: this.deviceConfig.mobileModel,
+            deviceType: this.deviceConfig.deviceType,
+            networkType: this.deviceConfig.networkType,
+            osType: this.deviceConfig.osType,
+            osVersion: this.deviceConfig.osVersion,
+            deviceName: this.deviceConfig.deviceName,
+        };
+
+        await this.setObjectNotExistsAsync('info.deviceIdentity', {
             type: 'state',
             common: {
-                name: 'Device Fingerprint',
+                name: 'Device Identity (without version)',
                 type: 'string',
                 role: 'json',
                 read: true,
@@ -138,7 +167,7 @@ class Byd extends utils.Adapter {
             },
             native: {},
         });
-        await this.setStateAsync('info.deviceConfig', JSON.stringify(this.deviceConfig), true);
+        await this.setStateAsync('info.deviceIdentity', JSON.stringify(identityFields), true);
     }
 
     async login() {
