@@ -104,7 +104,11 @@ class Byd extends utils.Adapter {
         const HTTP_FALLBACK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
         this.log.info('MQTT provides real-time updates, HTTP fallback every 30 minutes');
         this.updateInterval = setInterval(() => {
-            this.log.debug(`HTTP fallback update (MQTT ${this.mqttClient?.connected ? 'connected' : 'disconnected'})`);
+            if (this.mqttClient?.connected) {
+                this.log.debug('Skipping scheduled HTTP update - MQTT connected');
+                return;
+            }
+            this.log.debug('Scheduled HTTP update (MQTT disconnected)');
             this.updateVehicles();
         }, HTTP_FALLBACK_INTERVAL_MS);
     }
@@ -913,18 +917,28 @@ class Byd extends utils.Adapter {
             return;
         }
 
-        const controlState = respondData.controlState;
-        const requestSerial = respondData.requestSerial;
+        // Derive correlation serial (pyBYD: respondData.requestSerial || data.uuid)
+        const requestSerial = respondData.requestSerial || payload.data?.uuid;
         const commandType = respondData.commandType || payload.data?.commandType;
         const message = respondData.message || respondData.msg;
 
+        // Determine success from controlState or res field
         // controlState: 0=pending, 1=success, 2=failure
+        // res: 2=success, other=failure (pyBYD: res=2 → controlState=1)
+        let controlState = respondData.controlState;
+        if (controlState === undefined && respondData.res !== undefined) {
+            // Convert res format to controlState (pyBYD logic)
+            controlState = respondData.res === 2 ? 1 : 2;
+        }
+
         const success = controlState === 1;
         const failed = controlState === 2;
         const statusText = controlState === 0 ? 'pending' : controlState === 1 ? 'success' : 'failure';
         const msgSuffix = message ? ` (${message})` : '';
 
-        this.log.info(`MQTT remoteControl for ${vin}: ${commandType || 'unknown'} = ${statusText}${msgSuffix}`);
+        this.log.info(
+            `MQTT remoteControl for ${vin}: ${commandType || requestSerial || 'unknown'} = ${statusText}${msgSuffix}`,
+        );
 
         // Resolve pending waiter if we have a requestSerial match
         if (requestSerial && this.pendingRemoteControls.has(requestSerial)) {
