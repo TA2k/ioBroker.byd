@@ -223,7 +223,7 @@ class Byd extends utils.Adapter {
             .then(async res => {
                 // this.log.debug(`Vehicle list response: ${JSON.stringify(res.data)}`);
                 const decoded = bydapi.decodeEnvelope(res.data);
-                
+
                 if (decoded.code !== '0') {
                     if (await this.handleSessionExpired(decoded.code, 'getVehicleList')) {
                         this.log.info('Session restored, vehicle list will refresh on next cycle');
@@ -364,6 +364,7 @@ class Byd extends utils.Adapter {
 
     /**
      * Update data for a single vehicle via HTTP
+     *
      * @param {string} vin - Vehicle VIN (also used as object ID)
      */
     async updateSingleVehicle(vin) {
@@ -418,8 +419,8 @@ class Byd extends utils.Adapter {
 
     /**
      * Generic poll endpoint that triggers a request and polls for results
+     *
      * @param {string} vin - Vehicle VIN
-     * @param {string} id - ioBroker object ID
      * @param {object} endpoint - Endpoint config
      */
     async pollEndpoint(vin, endpoint) {
@@ -498,7 +499,11 @@ class Byd extends utils.Adapter {
                             if (endpoint.channelName) {
                                 parseOpts.channelName = endpoint.channelName;
                             }
-                            this.json2iob.parse(`${vin}.status${endpoint.channel ? '.' + endpoint.channel : ''}`, data, parseOpts);
+                            this.json2iob.parse(
+                                `${vin}.status${endpoint.channel ? `.${endpoint.channel}` : ''}`,
+                                data,
+                                parseOpts,
+                            );
                             ready = true;
                         }
                     }
@@ -547,6 +552,8 @@ class Byd extends utils.Adapter {
 
     /**
      * Trigger GPS request (result comes via MQTT)
+     *
+     * @param vin - Vehicle VIN
      */
     async triggerGps(vin) {
         const triggerReq = bydapi.buildGpsInfoRequest(
@@ -576,6 +583,7 @@ class Byd extends utils.Adapter {
 
     /**
      * Fetch a status endpoint and parse into ioBroker states
+     *
      * @param {string} vin - Vehicle VIN
      * @param {object} endpoint - Endpoint config { name, channel, url, builder, fallbackField }
      */
@@ -590,10 +598,14 @@ class Byd extends utils.Adapter {
             if (endpoint.fallbackField) {
                 const cached = this.realtimeCache[vin];
                 if (cached && cached[endpoint.fallbackField]) {
-                    this.json2iob.parse(`${vin}.status.${endpoint.channel}`, {
-                        [endpoint.fallbackField]: cached[endpoint.fallbackField],
-                        _fallback: true,
-                    }, { forceIndex: true, descriptions, states });
+                    this.json2iob.parse(
+                        `${vin}.status.${endpoint.channel}`,
+                        {
+                            [endpoint.fallbackField]: cached[endpoint.fallbackField],
+                            _fallback: true,
+                        },
+                        { forceIndex: true, descriptions, states },
+                    );
                 }
             }
             return;
@@ -642,10 +654,14 @@ class Byd extends utils.Adapter {
                     if (endpoint.fallbackField) {
                         const cached = this.realtimeCache[vin];
                         if (cached && cached[endpoint.fallbackField]) {
-                            this.json2iob.parse(`${vin}.status.${endpoint.channel}`, {
-                                [endpoint.fallbackField]: cached[endpoint.fallbackField],
-                                _fallback: true,
-                            }, { forceIndex: true, descriptions, states });
+                            this.json2iob.parse(
+                                `${vin}.status.${endpoint.channel}`,
+                                {
+                                    [endpoint.fallbackField]: cached[endpoint.fallbackField],
+                                    _fallback: true,
+                                },
+                                { forceIndex: true, descriptions, states },
+                            );
                         }
                     }
                 }
@@ -711,7 +727,7 @@ class Byd extends utils.Adapter {
             .then(async res => {
                 // this.log.debug(`EMQ broker response: ${JSON.stringify(res.data)}`);
                 const decoded = bydapi.decodeEnvelope(res.data);
-               
+
                 if (decoded.code !== '0') {
                     this.log.error(`EMQ broker lookup failed: code=${decoded.code} message=${decoded.message || ''}`);
                     return;
@@ -843,6 +859,7 @@ class Byd extends utils.Adapter {
 
     /**
      * Handle MQTT vehicleInfo event - realtime vehicle data
+     *
      * @param {string} vin - Vehicle VIN
      * @param {object} payload - MQTT payload
      */
@@ -872,6 +889,7 @@ class Byd extends utils.Adapter {
 
     /**
      * Handle MQTT remoteControl event - command result
+     *
      * @param {string} vin - Vehicle VIN
      * @param {object} payload - MQTT payload
      */
@@ -884,7 +902,9 @@ class Byd extends utils.Adapter {
 
         // GPS trigger response has different structure: {res: 2, data: {latitude, longitude, ...}}
         if (respondData.res !== undefined && respondData.data?.latitude !== undefined) {
-            this.log.debug(`MQTT GPS response for ${vin}: lat=${respondData.data.latitude}, lon=${respondData.data.longitude}`);
+            this.log.debug(
+                `MQTT GPS response for ${vin}: lat=${respondData.data.latitude}, lon=${respondData.data.longitude}`,
+            );
             this.json2iob.parse(`${vin}.status.gps`, respondData.data, {
                 forceIndex: true,
                 descriptions,
@@ -1097,7 +1117,7 @@ class Byd extends utils.Adapter {
                 data: { request: bydapi.encodeEnvelope(req.outer) },
             });
 
-          // this.log.debug(`Smart charging toggle response: ${JSON.stringify(res.data)}`);
+            // this.log.debug(`Smart charging toggle response: ${JSON.stringify(res.data)}`);
             const decoded = bydapi.decodeEnvelope(res.data);
             this.log.debug(`Decoded smart charging toggle: ${JSON.stringify(decoded)}`);
             if (decoded.code !== '0') {
@@ -1152,7 +1172,7 @@ class Byd extends utils.Adapter {
                 data: { request: bydapi.encodeEnvelope(req.outer) },
             });
 
-          //  this.log.debug(`Charging schedule save response: ${JSON.stringify(res.data)}`);
+            //  this.log.debug(`Charging schedule save response: ${JSON.stringify(res.data)}`);
             const decoded = bydapi.decodeEnvelope(res.data);
             this.log.debug(`Decoded charging schedule save: ${JSON.stringify(decoded)}`);
             if (decoded.code !== '0') {
@@ -1215,7 +1235,7 @@ class Byd extends utils.Adapter {
                 data: { request: bydapi.encodeEnvelope(triggerReq.outer) },
             });
 
-          //  this.log.debug(`Remote control trigger response: ${JSON.stringify(res.data)}`);
+            //  this.log.debug(`Remote control trigger response: ${JSON.stringify(res.data)}`);
             const decoded = bydapi.decodeEnvelope(res.data);
             // this.log.debug(`Decoded remote control trigger: ${JSON.stringify(decoded)}`);
             if (decoded.code !== '0') {
@@ -1369,9 +1389,9 @@ class Byd extends utils.Adapter {
         // Note: realtime data is parsed directly into status (not status.realtime)
         const statusToRemoteMap = {
             'hvac.statusNow.status': { remote: 'climate', transform: v => v === 2 },
-            'batteryHeatState': { remote: 'batteryHeat', transform: v => v > 0 },
-            'mainSeatHeatState': { remote: 'seatHeat', transform: v => v > 0 },
-            'leftFrontDoorLock': { remote: 'lock', transform: v => v === 2 },
+            batteryHeatState: { remote: 'batteryHeat', transform: v => v > 0 },
+            mainSeatHeatState: { remote: 'seatHeat', transform: v => v > 0 },
+            leftFrontDoorLock: { remote: 'lock', transform: v => v === 2 },
         };
 
         // Handle ack=true status changes -> update remote states
@@ -1394,7 +1414,9 @@ class Byd extends utils.Adapter {
 
         // Handle ack===false for commands
         if (!state.ack && folder === 'remote') {
-            this.log.debug(`DEBUG onStateChange: id=${id}, val=${state.val}, ack=${state.ack}, ts=${state.ts}, lc=${state.lc}`);
+            this.log.debug(
+                `DEBUG onStateChange: id=${id}, val=${state.val}, ack=${state.ack}, ts=${state.ts}, lc=${state.lc}`,
+            );
 
             if (command === 'refresh') {
                 // Ignore if value is not true (button press)
