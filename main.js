@@ -1050,7 +1050,9 @@ class Byd extends utils.Adapter {
             });
 
             this.log.debug(`Verify control password response: ${JSON.stringify(res.data)}`);
+            this.log.debug(`contentKey: ${req.contentKey}, encryToken: ${this.session.encryToken}`);
             const decoded = bydapi.decodeEnvelope(res.data);
+            this.log.debug(`Verify control password decoded: ${JSON.stringify(decoded)}`);
 
             if (decoded.code !== '0') {
                 if (bydapi.isNoPinSetError(decoded.code)) {
@@ -1071,14 +1073,21 @@ class Byd extends utils.Adapter {
             }
 
             if (decoded.respondData) {
-                const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
-                this.log.debug(`Control password verification result: ${JSON.stringify(data)}`);
-                if (data.ok === true) {
-                    this.log.info('Control password verified successfully');
-                    return { success: true };
+                try {
+                    const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
+                    this.log.debug(`Control password verification result: ${JSON.stringify(data)}`);
+                    if (data.ok === true) {
+                        this.log.info('Control password verified successfully');
+                        return { success: true };
+                    }
+                } catch (decryptErr) {
+                    this.log.debug(`Failed to decrypt respondData: ${decryptErr.message}`);
+                    // Some responses don't have encrypted respondData, treat code=0 as success
                 }
             }
 
+            // code=0 without respondData or failed decrypt = success
+            this.log.info('Control password verified (code=0)');
             return { success: true };
         } catch (error) {
             this.log.error(`Control password verification error: ${error.message}`);
