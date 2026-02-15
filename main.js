@@ -87,8 +87,7 @@ class Byd extends utils.Adapter {
                 }
             }
         } else if (!this.config.controlPin) {
-            this.log.warn('No control PIN configured in ioBroker adapter settings');
-            this.log.warn('Remote control commands require a PIN (same as in BYD app)');
+            this.log.info('No control PIN configured - some remote commands may require a PIN');
         }
 
         // Initial data fetch via HTTP (once at startup)
@@ -1386,6 +1385,11 @@ class Byd extends utils.Adapter {
                         return this.sendRemoteControl(vin, commandType, controlParamsMap, retryCount + 1);
                     }
                     return { success: false, error: 'Session expired' };
+                }
+
+                if (bydapi.isRemoteControlServiceError(decoded.code)) {
+                    this.log.warn('Remote control service error (1009) - vehicle offline or T-Box not responding');
+                    return { success: false, error: 'Vehicle offline or service unavailable' };
                 }
 
                 triggerError = `API error: ${decoded.code}`;
