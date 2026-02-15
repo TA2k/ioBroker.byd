@@ -177,32 +177,18 @@ class Byd extends utils.Adapter {
                     return;
                 }
 
-                // Sample loginData:
-                // {
-                //   "token": {
-                //     "userId": "1234567890123456789",
-                //     "signToken": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-                //     "encryToken": "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy",
-                //     "accessToken": "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"
-                //   },
-                //   "user": { "nickname": "User", "email": "user@example.com", "countryCode": "AT" },
-                //   "securityInfo": { "isPwdSet": 1, "isGesturePwdSet": 0 }
-                // }
                 const loginKey = bydapi.pwdLoginKey(this.config.password);
                 const loginData = bydapi.decryptResponseData(decoded.respondData, loginKey);
                 const token = loginData.token || {};
-                const data = {
+
+                this.session = {
                     userId: token.userId,
                     signToken: token.signToken,
                     encryToken: token.encryToken,
                 };
-                this.session = {
-                    userId: data.userId,
-                    signToken: data.signToken,
-                    encryToken: data.encryToken,
-                };
 
                 this.log.info('Login successful');
+                this.log.debug(`DEBUG login: session set, userId=${this.session.userId}`);
                 this.setState('info.connection', true, true);
             })
             .catch(error => {
@@ -273,7 +259,6 @@ class Byd extends utils.Adapter {
                         continue;
                     }
 
-                    const id = vin.toString().replace(this.FORBIDDEN_CHARS, '_');
                     this.vehicleArray.push(vehicle);
 
                     // Device name: Model + Plate (e.g. "BYD SEALION 7 - KO591ET")
@@ -281,14 +266,14 @@ class Byd extends utils.Adapter {
                     const plate = vehicle.autoPlate || '';
                     const deviceName = plate ? `${modelName} - ${plate}` : modelName;
 
-                    await this.extendObject(id, {
+                    await this.extendObject(vin, {
                         type: 'device',
                         common: { name: deviceName },
                         native: {},
                     });
 
                     // Channel: general - static vehicle information
-                    await this.setObjectNotExistsAsync(`${id}.general`, {
+                    await this.setObjectNotExistsAsync(`${vin}.general`, {
                         type: 'channel',
                         common: { name: 'General Information' },
                         native: {},
@@ -307,21 +292,21 @@ class Byd extends utils.Adapter {
                         autoBoughtTime: vehicle.autoBoughtTime,
                         yunActiveTime: vehicle.yunActiveTime,
                     };
-                    this.json2iob.parse(`${id}.general`, generalData, {
+                    this.json2iob.parse(`${vin}.general`, generalData, {
                         forceIndex: true,
                         descriptions,
                         states,
                     });
 
                     // Channel: status - realtime data from API/MQTT
-                    await this.setObjectNotExistsAsync(`${id}.status`, {
+                    await this.setObjectNotExistsAsync(`${vin}.status`, {
                         type: 'channel',
                         common: { name: 'Vehicle Status' },
                         native: {},
                     });
 
                     // Channel: remote - control commands
-                    await this.setObjectNotExistsAsync(`${id}.remote`, {
+                    await this.setObjectNotExistsAsync(`${vin}.remote`, {
                         type: 'channel',
                         common: { name: 'Remote Controls' },
                         native: {},
@@ -329,21 +314,21 @@ class Byd extends utils.Adapter {
 
                     const remoteArray = [
                         { command: 'refresh', name: 'Refresh Data' },
-                        { command: 'lock', name: 'Lock Doors' },
-                        { command: 'unlock', name: 'Unlock Doors' },
+                        { command: 'lock', name: 'Door Lock true = locked, false = unlocked' },
                         { command: 'flash', name: 'Flash Lights' },
                         { command: 'findCar', name: 'Find Car (Flash + Horn)' },
                         { command: 'closeWindows', name: 'Close Windows' },
-                        { command: 'climate', name: 'Climate Control' },
-                        { command: 'seatHeat', name: 'Seat Heating' },
-                        { command: 'batteryHeat', name: 'Battery Heating' },
+                        { command: 'climate', name: 'Climate Control true = on, false = off' },
+                        { command: 'seatHeat', name: 'Seat Heating true = on, false = off' },
+                        { command: 'batteryHeat', name: 'Battery Heating true = on, false = off' },
                     ];
 
                     for (const remote of remoteArray) {
-                        this.extendObject(`${id}.remote.${remote.command}`, {
+                        this.extendObject(`${vin}.remote.${remote.command}`, {
                             type: 'state',
                             common: {
                                 name: remote.name || '',
+                                desc: remote.desc || '',
                                 type: 'boolean',
                                 role: 'button',
                                 def: false,
@@ -373,29 +358,25 @@ class Byd extends utils.Adapter {
         }
 
         for (const vehicle of this.vehicleArray) {
-            const vin = vehicle.vin;
-            const id = vin.toString().replace(this.FORBIDDEN_CHARS, '_');
-            await this.updateSingleVehicle(vin, id);
+            await this.updateSingleVehicle(vehicle.vin);
         }
     }
 
     /**
      * Update data for a single vehicle via HTTP
      *
-     * @param {string} vin - Vehicle VIN
-     * @param {string} [id] - ioBroker object ID (optional, derived from VIN if not provided)
+     * @param {string} vin - Vehicle VIN (also used as object ID)
      */
-    async updateSingleVehicle(vin, id) {
+    async updateSingleVehicle(vin) {
+        this.log.debug(`DEBUG updateSingleVehicle: vin=${vin}, session=${this.session ? 'exists' : 'null'}`);
         if (!this.session) {
             this.log.warn('No session for vehicle update');
             return;
         }
 
-        const objId = id || vin.toString().replace(this.FORBIDDEN_CHARS, '_');
-
-        await this.pollVehicleRealtime(vin, objId);
-        await this.pollGpsInfo(vin, objId);
-        await this.getVehicleStatusEndpoints(vin, objId);
+        await this.pollVehicleRealtime(vin);
+        await this.pollGpsInfo(vin);
+        await this.getVehicleStatusEndpoints(vin);
     }
 
     /**
@@ -410,6 +391,7 @@ class Byd extends utils.Adapter {
             return false;
         }
         this.log.warn(`Session expired (code=${code}) in ${context} - re-authenticating`);
+        this.log.debug(`DEBUG: Setting session=null in handleSessionExpired (code=${code}, context=${context})`);
         this.session = null;
         this.setState('info.connection', false, true);
         await this.login();
@@ -437,11 +419,11 @@ class Byd extends utils.Adapter {
 
     /**
      * Generic poll endpoint that triggers a request and polls for results
+     *
      * @param {string} vin - Vehicle VIN
-     * @param {string} id - ioBroker object ID
      * @param {object} endpoint - Endpoint config
      */
-    async pollEndpoint(vin, id, endpoint) {
+    async pollEndpoint(vin, endpoint) {
         if (!this.session) {
             return;
         }
@@ -467,7 +449,7 @@ class Byd extends utils.Adapter {
             data: { request: bydapi.encodeEnvelope(triggerReq.outer) },
         })
             .then(async res => {
-                this.log.debug(`${endpoint.name} trigger response: ${JSON.stringify(res.data)}`);
+                // this.log.debug(`${endpoint.name} trigger response: ${JSON.stringify(res.data)}`);
                 const decoded = bydapi.decodeEnvelope(res.data);
                 if (decoded.code === '0' && decoded.respondData) {
                     const data = bydapi.decryptResponseData(decoded.respondData, triggerReq.contentKey);
@@ -503,7 +485,7 @@ class Byd extends utils.Adapter {
                 data: { request: bydapi.encodeEnvelope(pollReq.outer) },
             })
                 .then(async res => {
-                    this.log.debug(`${endpoint.name} poll response: ${JSON.stringify(res.data)}`);
+                    // this.log.debug(`${endpoint.name} poll response: ${JSON.stringify(res.data)}`);
                     const decoded = bydapi.decodeEnvelope(res.data);
                     if (decoded.code === '0' && decoded.respondData) {
                         const data = bydapi.decryptResponseData(decoded.respondData, pollReq.contentKey);
@@ -517,7 +499,11 @@ class Byd extends utils.Adapter {
                             if (endpoint.channelName) {
                                 parseOpts.channelName = endpoint.channelName;
                             }
-                            this.json2iob.parse(`${id}.status${endpoint.channel ? '.' + endpoint.channel : ''}`, data, parseOpts);
+                            this.json2iob.parse(
+                                `${vin}.status${endpoint.channel ? `.${endpoint.channel}` : ''}`,
+                                data,
+                                parseOpts,
+                            );
                             ready = true;
                         }
                     }
@@ -532,8 +518,8 @@ class Byd extends utils.Adapter {
         }
     }
 
-    async pollVehicleRealtime(vin, id) {
-        await this.pollEndpoint(vin, id, {
+    async pollVehicleRealtime(vin) {
+        await this.pollEndpoint(vin, {
             name: 'Realtime',
             triggerUrl: '/vehicleInfo/vehicle/vehicleRealTimeRequest',
             pollUrl: '/vehicleInfo/vehicle/vehicleRealTimeResult',
@@ -543,8 +529,17 @@ class Byd extends utils.Adapter {
         });
     }
 
-    async pollGpsInfo(vin, id) {
-        await this.pollEndpoint(vin, id, {
+    async pollGpsInfo(vin) {
+        // If MQTT is connected, only trigger - MQTT will deliver the result
+        if (this.mqttClient?.connected) {
+            this.log.debug('GPS: MQTT connected, trigger only (no API poll)');
+            await this.triggerGps(vin);
+            return;
+        }
+
+        // Fallback: MQTT not connected, use API polling
+        this.log.debug('GPS: MQTT not connected, using API poll fallback');
+        await this.pollEndpoint(vin, {
             name: 'GPS',
             triggerUrl: '/control/getGpsInfo',
             pollUrl: '/control/getGpsInfoResult',
@@ -556,12 +551,43 @@ class Byd extends utils.Adapter {
     }
 
     /**
+     * Trigger GPS request (result comes via MQTT)
+     *
+     * @param vin - Vehicle VIN
+     */
+    async triggerGps(vin) {
+        const triggerReq = bydapi.buildGpsInfoRequest(
+            this.session,
+            this.config.countryCode,
+            this.config.language,
+            this.deviceConfig,
+            vin,
+        );
+
+        await this.requestClient({
+            method: 'post',
+            url: `${bydapi.BASE_URL}/control/getGpsInfo`,
+            headers: {
+                'User-Agent': bydapi.USER_AGENT,
+                'Content-Type': 'application/json; charset=UTF-8',
+            },
+            data: { request: bydapi.encodeEnvelope(triggerReq.outer) },
+        })
+            .then(res => {
+                this.log.debug(`GPS trigger response: ${JSON.stringify(res.data)}`);
+            })
+            .catch(error => {
+                this.log.warn(`GPS trigger failed: ${error.message}`);
+            });
+    }
+
+    /**
      * Fetch a status endpoint and parse into ioBroker states
+     *
      * @param {string} vin - Vehicle VIN
-     * @param {string} id - ioBroker object ID
      * @param {object} endpoint - Endpoint config { name, channel, url, builder, fallbackField }
      */
-    async fetchStatusEndpoint(vin, id, endpoint) {
+    async fetchStatusEndpoint(vin, endpoint) {
         if (!this.session) {
             return;
         }
@@ -572,10 +598,14 @@ class Byd extends utils.Adapter {
             if (endpoint.fallbackField) {
                 const cached = this.realtimeCache[vin];
                 if (cached && cached[endpoint.fallbackField]) {
-                    this.json2iob.parse(`${id}.status.${endpoint.channel}`, {
-                        [endpoint.fallbackField]: cached[endpoint.fallbackField],
-                        _fallback: true,
-                    }, { forceIndex: true, descriptions, states });
+                    this.json2iob.parse(
+                        `${vin}.status.${endpoint.channel}`,
+                        {
+                            [endpoint.fallbackField]: cached[endpoint.fallbackField],
+                            _fallback: true,
+                        },
+                        { forceIndex: true, descriptions, states },
+                    );
                 }
             }
             return;
@@ -605,7 +635,7 @@ class Byd extends utils.Adapter {
                 if (decoded.code === '0' && decoded.respondData) {
                     const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
                     this.log.debug(`${endpoint.name} data: ${JSON.stringify(data)}`);
-                    this.json2iob.parse(`${id}.status.${endpoint.channel}`, data, {
+                    this.json2iob.parse(`${vin}.status.${endpoint.channel}`, data, {
                         forceIndex: true,
                         channelName: endpoint.channelName,
                         descriptions,
@@ -624,10 +654,14 @@ class Byd extends utils.Adapter {
                     if (endpoint.fallbackField) {
                         const cached = this.realtimeCache[vin];
                         if (cached && cached[endpoint.fallbackField]) {
-                            this.json2iob.parse(`${id}.status.${endpoint.channel}`, {
-                                [endpoint.fallbackField]: cached[endpoint.fallbackField],
-                                _fallback: true,
-                            }, { forceIndex: true, descriptions, states });
+                            this.json2iob.parse(
+                                `${vin}.status.${endpoint.channel}`,
+                                {
+                                    [endpoint.fallbackField]: cached[endpoint.fallbackField],
+                                    _fallback: true,
+                                },
+                                { forceIndex: true, descriptions, states },
+                            );
                         }
                     }
                 }
@@ -637,7 +671,7 @@ class Byd extends utils.Adapter {
             });
     }
 
-    async getVehicleStatusEndpoints(vin, id) {
+    async getVehicleStatusEndpoints(vin) {
         const endpoints = [
             {
                 name: 'energy',
@@ -664,7 +698,7 @@ class Byd extends utils.Adapter {
         ];
 
         for (const endpoint of endpoints) {
-            await this.fetchStatusEndpoint(vin, id, endpoint);
+            await this.fetchStatusEndpoint(vin, endpoint);
         }
     }
 
@@ -795,19 +829,15 @@ class Byd extends utils.Adapter {
                 return;
             }
 
-            const id = vin.toString().replace(this.FORBIDDEN_CHARS, '_');
-
             if (eventType === 'vehicleInfo') {
-                // Vehicle info update - main realtime data
-                this.handleMqttVehicleInfo(id, vin, payload);
+                this.handleMqttVehicleInfo(vin, payload);
             } else if (eventType === 'remoteControl') {
-                // Remote control result
-                this.handleMqttRemoteControl(id, vin, payload);
+                this.handleMqttRemoteControl(vin, payload);
             } else if (payload.data) {
                 // Generic data update with wrapper
                 this.log.info(`MQTT update for ${vin}: type=${eventType || 'unknown'}`);
                 const respondData = payload.data?.respondData || payload.data;
-                this.json2iob.parse(`${id}.status.mqtt`, respondData, {
+                this.json2iob.parse(`${vin}.status.mqtt`, respondData, {
                     forceIndex: true,
                     descriptions,
                     states,
@@ -815,7 +845,7 @@ class Byd extends utils.Adapter {
             } else {
                 // Direct data without wrapper
                 this.log.debug(`MQTT generic message for ${vin}`);
-                this.json2iob.parse(`${id}.status.mqtt`, payload, {
+                this.json2iob.parse(`${vin}.status.mqtt`, payload, {
                     forceIndex: true,
                     descriptions,
                     states,
@@ -829,12 +859,10 @@ class Byd extends utils.Adapter {
     /**
      * Handle MQTT vehicleInfo event - realtime vehicle data
      *
-     * @param {string} id - ioBroker object ID
      * @param {string} vin - Vehicle VIN
      * @param {object} payload - MQTT payload
      */
-    handleMqttVehicleInfo(id, vin, payload) {
-        // Extract respondData from nested structure
+    handleMqttVehicleInfo(vin, payload) {
         const respondData = payload.data?.respondData;
         if (!respondData || typeof respondData !== 'object') {
             this.log.debug(`MQTT vehicleInfo without respondData for ${vin}`);
@@ -850,8 +878,8 @@ class Byd extends utils.Adapter {
             _mqttTimestamp: Date.now(),
         };
 
-        // Parse into status channel (like HTTP realtime data)
-        this.json2iob.parse(`${id}.status`, respondData, {
+        // Parse into status channel
+        this.json2iob.parse(`${vin}.status`, respondData, {
             forceIndex: true,
             descriptions,
             states,
@@ -861,14 +889,26 @@ class Byd extends utils.Adapter {
     /**
      * Handle MQTT remoteControl event - command result
      *
-     * @param {string} id - ioBroker object ID
      * @param {string} vin - Vehicle VIN
      * @param {object} payload - MQTT payload
      */
-    handleMqttRemoteControl(id, vin, payload) {
+    handleMqttRemoteControl(vin, payload) {
         const respondData = payload.data?.respondData;
         if (!respondData || typeof respondData !== 'object') {
             this.log.debug(`MQTT remoteControl without respondData for ${vin}`);
+            return;
+        }
+
+        // GPS trigger response has different structure: {res: 2, data: {latitude, longitude, ...}}
+        if (respondData.res !== undefined && respondData.data?.latitude !== undefined) {
+            this.log.debug(
+                `MQTT GPS response for ${vin}: lat=${respondData.data.latitude}, lon=${respondData.data.longitude}`,
+            );
+            this.json2iob.parse(`${vin}.status.gps`, respondData.data, {
+                forceIndex: true,
+                descriptions,
+                states,
+            });
             return;
         }
 
@@ -920,7 +960,7 @@ class Byd extends utils.Adapter {
         }
 
         // Store control result
-        this.json2iob.parse(`${id}.status.mqtt.remoteControl`, respondData, {
+        this.json2iob.parse(`${vin}.status.mqtt.remoteControl`, respondData, {
             forceIndex: true,
             descriptions,
             states,
@@ -930,10 +970,10 @@ class Byd extends utils.Adapter {
         if (success && commandType) {
             const cmdUpper = String(commandType).toUpperCase();
             if (cmdUpper === 'CLOSEAIR') {
-                this.setStateAsync(`${id}.hvac.status`, 0, true).catch(() => {});
-                this.setStateAsync(`${id}.hvac.acSwitch`, 0, true).catch(() => {});
+                this.setStateAsync(`${vin}.status.hvac.status`, 0, true).catch(() => {});
+                this.setStateAsync(`${vin}.status.hvac.acSwitch`, 0, true).catch(() => {});
             } else if (cmdUpper === 'OPENAIR') {
-                this.setStateAsync(`${id}.hvac.status`, 2, true).catch(() => {});
+                this.setStateAsync(`${vin}.status.hvac.status`, 2, true).catch(() => {});
             }
         }
     }
@@ -1216,12 +1256,18 @@ class Byd extends utils.Adapter {
 
                 if (bydapi.isSessionExpired(decoded.code)) {
                     this.log.warn('Session expired, re-authenticating...');
+                    this.log.debug(`DEBUG: Setting session=null in sendRemoteControl (code=${decoded.code})`);
                     this.session = null;
                     await this.login();
                     if (this.session && retryCount < 1) {
                         return this.sendRemoteControl(vin, commandType, controlParamsMap, retryCount + 1);
                     }
                     return { success: false, error: 'Session expired' };
+                }
+
+                if (bydapi.isRemoteControlServiceError(decoded.code)) {
+                    this.log.error(`Remote control failed (1009): Vehicle offline or T-Box not responding`);
+                    return { success: false, error: 'Vehicle unreachable (1009)' };
                 }
 
                 triggerError = `API error: ${decoded.code}`;
@@ -1334,19 +1380,62 @@ class Byd extends utils.Adapter {
 
         const deviceId = id.split('.')[2];
         const folder = id.split('.')[3];
-        const command = id.split('.')[4];
+        const subPath = id.split('.').slice(4).join('.');
 
-        // Handle ack===true to update remote states
+        // Mapping: status path -> { remote, transform }
+        // When status changes with ack=true, update corresponding remote state
+        // Note: realtime data is parsed directly into status (not status.realtime)
+        const statusToRemoteMap = {
+            'hvac.statusNow.status': { remote: 'climate', transform: v => v === 2 },
+            batteryHeatState: { remote: 'batteryHeat', transform: v => v > 0 },
+            mainSeatHeatState: { remote: 'seatHeat', transform: v => v > 0 },
+            leftFrontDoorLock: { remote: 'lock', transform: v => v === 2 },
+        };
+
+        // Handle ack=true status changes -> update remote states
+        if (state.ack && folder === 'status') {
+            const mapping = statusToRemoteMap[subPath];
+            if (mapping) {
+                const boolVal = mapping.transform(state.val);
+                await this.setStateAsync(`${deviceId}.remote.${mapping.remote}`, boolVal, true);
+                this.log.debug(`Status ${subPath}=${state.val} -> remote.${mapping.remote}=${boolVal}`);
+            }
+            return;
+        }
+
+        // Handle ack===true for remote states (ignore)
         if (state.ack && folder === 'remote') {
             return;
         }
 
+        const command = id.split('.')[4];
+
         // Handle ack===false for commands
         if (!state.ack && folder === 'remote') {
+            this.log.debug(
+                `DEBUG onStateChange: id=${id}, val=${state.val}, ack=${state.ack}, ts=${state.ts}, lc=${state.lc}`,
+            );
+
             if (command === 'refresh') {
+                // Ignore if value is not true (button press)
+                if (state.val !== true) {
+                    this.log.debug(`DEBUG refresh ignored: val=${state.val} (not true)`);
+                    return;
+                }
                 this.log.info(`Manual refresh requested for ${deviceId}`);
+                this.log.debug(`DEBUG refresh: session=${this.session ? 'exists' : 'null'}`);
+                if (!this.session) {
+                    this.log.warn('No session - attempting re-login before refresh');
+                    await this.login();
+                    this.log.debug(`DEBUG refresh after login: session=${this.session ? 'exists' : 'null'}`);
+                }
+                if (!this.session) {
+                    this.log.error('Still no session after re-login attempt');
+                    return;
+                }
+                this.log.debug(`DEBUG refresh: calling updateSingleVehicle`);
                 await this.updateSingleVehicle(deviceId);
-                await this.setStateAsync(id, false, true);
+                this.log.debug(`DEBUG refresh: updateSingleVehicle done`);
                 return;
             }
 
@@ -1374,7 +1463,6 @@ class Byd extends utils.Adapter {
                     await this.sendRemoteControl(deviceId, 'CLOSEAIR', controlParamsMap);
                 }
 
-                await this.setStateAsync(id, state.val, true);
                 this.refreshTimeout && clearTimeout(this.refreshTimeout);
                 this.refreshTimeout = setTimeout(() => {
                     this.updateVehicles();
@@ -1393,7 +1481,6 @@ class Byd extends utils.Adapter {
                 });
                 await this.sendRemoteControl(deviceId, 'VENTILATIONHEATING', controlParamsMap);
 
-                await this.setStateAsync(id, state.val, true);
                 this.refreshTimeout && clearTimeout(this.refreshTimeout);
                 this.refreshTimeout = setTimeout(() => {
                     this.updateVehicles();
@@ -1408,7 +1495,6 @@ class Byd extends utils.Adapter {
                 const controlParamsMap = bydapi.buildBatteryHeatParams(state.val);
                 await this.sendRemoteControl(deviceId, 'BATTERYHEAT', controlParamsMap);
 
-                await this.setStateAsync(id, state.val, true);
                 this.refreshTimeout && clearTimeout(this.refreshTimeout);
                 this.refreshTimeout = setTimeout(() => {
                     this.updateVehicles();
@@ -1427,14 +1513,23 @@ class Byd extends utils.Adapter {
                         this.log.error(`Control PIN verification failed: ${result.error}`);
                     }
                 }
-                await this.setStateAsync(id, false, true);
+                return;
+            }
+
+            // Lock toggle: true=lock, false=unlock
+            if (command === 'lock') {
+                const commandType = state.val ? 'LOCKDOOR' : 'OPENDOOR';
+                this.log.info(`Sending lock command: ${state.val ? 'LOCK' : 'UNLOCK'} for ${deviceId}`);
+                await this.sendRemoteControl(deviceId, commandType);
+                this.refreshTimeout && clearTimeout(this.refreshTimeout);
+                this.refreshTimeout = setTimeout(() => {
+                    this.updateVehicles();
+                }, 10 * 1000);
                 return;
             }
 
             // Commands using commandType (no controlParamsMap needed)
             const commandTypeMap = {
-                lock: 'LOCKDOOR',
-                unlock: 'OPENDOOR',
                 flash: 'FLASHLIGHTNOWHISTLE',
                 findCar: 'FINDCAR',
                 closeWindows: 'CLOSEWINDOW',
@@ -1449,9 +1544,6 @@ class Byd extends utils.Adapter {
             this.log.info(`Sending remote command: ${command} (${commandType}) for ${deviceId}`);
 
             await this.sendRemoteControl(deviceId, commandType);
-
-            // Acknowledge the state change
-            await this.setStateAsync(id, state.val, true);
 
             // Schedule refresh after command
             this.refreshTimeout && clearTimeout(this.refreshTimeout);
