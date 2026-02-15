@@ -99,25 +99,6 @@
             },
             "newLine": true,
             "sm": 3
-        },
-        "interval": {
-            "type": "number",
-            "label": {
-                "en": "Update interval (seconds)",
-                "de": "Aktualisierungsintervall (Sekunden)",
-                "ru": "Интервал обновления (секунды)",
-                "pt": "Intervalo de atualização (segundos)",
-                "nl": "Update-interval (seconden)",
-                "fr": "Intervalle de mise à jour (secondes)",
-                "it": "Intervallo di aggiornamento (secondi)",
-                "es": "Intervalo de actualización (segundos)",
-                "pl": "Interwał aktualizacji (sekundy)",
-                "uk": "Інтервал оновлення (секунди)",
-                "zh-cn": "更新间隔（秒）"
-            },
-            "newLine": true,
-            "min": 60,
-            "sm": 3
         }
     }
 }

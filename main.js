@@ -35,6 +35,11 @@ class Byd extends utils.Adapter {
         // MQTT client for push notifications
         this.mqttClient = null;
         this.mqttBroker = null;
+        // Pending remote control commands waiting for MQTT result
+        // Map: requestSerial -> { resolve, reject, vin, command, timestamp }
+        this.pendingRemoteControls = new Map();
+        // MQTT command timeout in ms (pyBYD uses 8 seconds)
+        this.mqttCommandTimeout = 8000;
 
         const jar = new CookieJar();
         this.requestClient = wrapper(
@@ -48,11 +53,6 @@ class Byd extends utils.Adapter {
 
     async onReady() {
         this.setState('info.connection', false, true);
-
-        if (this.config.interval < 60) {
-            this.log.info('Set interval to minimum 60');
-            this.config.interval = 60;
-        }
 
         if (!this.config.username || !this.config.password) {
             this.log.error('Please set username and password in the instance settings');
@@ -71,12 +71,42 @@ class Byd extends utils.Adapter {
         }
 
         await this.getVehicleList();
+
+        // Verify control PIN at startup if configured
+        if (this.config.controlPin && this.vehicleArray.length > 0) {
+            const firstVin = this.vehicleArray[0].vin;
+            this.log.info('Verifying control PIN at startup...');
+            const result = await this.verifyControlPassword(firstVin);
+            if (!result.success) {
+                if (result.noPinInApp) {
+                    // Don't repeat error - already logged in verifyControlPassword
+                    this.log.warn('Remote control disabled - no PIN set in BYD app');
+                } else {
+                    this.log.error(`Control PIN verification failed: ${result.error}`);
+                    this.log.error('Remote control commands will not work until PIN is corrected');
+                }
+            }
+        } else if (!this.config.controlPin) {
+            this.log.warn('No control PIN configured in ioBroker adapter settings');
+            this.log.warn('Remote control commands require a PIN (same as in BYD app)');
+        }
+
+        // Initial data fetch via HTTP (once at startup)
         await this.updateVehicles();
+
+        // Connect MQTT for real-time updates (primary data source)
         await this.connectMqtt();
 
+        // MQTT-first architecture:
+        // - MQTT provides real-time updates (vehicleInfo events)
+        // - HTTP only as fallback every 30 minutes for consistency
+        // - Use remote.refresh button for manual updates
+        const HTTP_FALLBACK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+        this.log.info('MQTT provides real-time updates, HTTP fallback every 30 minutes');
         this.updateInterval = setInterval(() => {
+            this.log.debug(`HTTP fallback update (MQTT ${this.mqttClient?.connected ? 'connected' : 'disconnected'})`);
             this.updateVehicles();
-        }, this.config.interval * 1000);
+        }, HTTP_FALLBACK_INTERVAL_MS);
     }
 
     async loadOrGenerateDeviceConfig() {
@@ -261,6 +291,7 @@ class Byd extends utils.Adapter {
                         { command: 'closeWindows', name: 'True = Close Windows' },
                         { command: 'climate', name: 'True = Start Climate, False = Stop Climate' },
                         { command: 'seatHeat', name: 'True = Start Seat Heating, False = Stop' },
+                        { command: 'batteryHeat', name: 'True = Start Battery Heating, False = Stop' },
                     ];
 
                     for (const remote of remoteArray) {
@@ -305,13 +336,29 @@ class Byd extends utils.Adapter {
         for (const vehicle of this.vehicleArray) {
             const vin = vehicle.vin;
             const id = vin.toString().replace(this.FORBIDDEN_CHARS, '_');
-
-            await this.pollVehicleRealtime(vin, id);
-            await this.pollGpsInfo(vin, id);
-            await this.getEnergyConsumption(vin, id);
-            await this.getHvacStatus(vin, id);
-            await this.getChargingStatus(vin, id);
+            await this.updateSingleVehicle(vin, id);
         }
+    }
+
+    /**
+     * Update data for a single vehicle via HTTP
+     *
+     * @param {string} vin - Vehicle VIN
+     * @param {string} [id] - ioBroker object ID (optional, derived from VIN if not provided)
+     */
+    async updateSingleVehicle(vin, id) {
+        if (!this.session) {
+            this.log.warn('No session for vehicle update');
+            return;
+        }
+
+        const objId = id || vin.toString().replace(this.FORBIDDEN_CHARS, '_');
+
+        await this.pollVehicleRealtime(vin, objId);
+        await this.pollGpsInfo(vin, objId);
+        await this.getEnergyConsumption(vin, objId);
+        await this.getHvacStatus(vin, objId);
+        await this.getChargingStatus(vin, objId);
     }
 
     /**
@@ -782,7 +829,7 @@ class Byd extends utils.Adapter {
         const clientId = bydapi.buildMqttClientId(this.deviceConfig.imeiMd5);
         const tsSeconds = Math.floor(Date.now() / 1000);
         const mqttPassword = bydapi.buildMqttPassword(this.session, clientId, tsSeconds);
-        const topic = `/oversea/res/${this.session.userId}`;
+        const topic = `oversea/res/${this.session.userId}`;
 
         this.log.info(`Connecting to MQTT broker: ${this.mqttBroker}`);
 
@@ -834,7 +881,7 @@ class Byd extends utils.Adapter {
             const messageStr = message.toString();
             this.log.debug(`MQTT message on ${topic}: ${messageStr}`);
 
-            // Try to parse as JSON
+            // Try to parse as JSON, otherwise decrypt if hex-encoded
             let payload;
             try {
                 payload = JSON.parse(messageStr);
@@ -850,48 +897,388 @@ class Byd extends utils.Adapter {
                 }
             }
 
-            // Handle different message types
-            // Sample push messages:
-            // - Vehicle status update: { "vin": "...", "type": "vehicleStatus", "data": {...} }
-            // - Charging update: { "vin": "...", "type": "charging", "data": {...} }
-            // - Remote control result: { "vin": "...", "type": "remoteControl", "data": {...} }
-            if (payload.vin) {
-                const vin = payload.vin;
-                const id = vin.toString().replace(this.FORBIDDEN_CHARS, '_');
+            // pyBYD event types: "vehicleInfo", "remoteControl"
+            // Payload structure: { "event": "vehicleInfo", "vin": "...", "data": { "respondData": {...} } }
+            const eventType = payload.event || payload.type;
+            const vin = payload.vin;
 
-                if (payload.data) {
-                    this.log.info(`MQTT push update for ${vin}: type=${payload.type || 'unknown'}`);
-                    this.json2iob.parse(`${id}.mqtt`, payload.data, {
-                        forceIndex: true,
-                        descriptions,
-                        states,
-                    });
+            if (!vin) {
+                this.log.debug(`MQTT message without VIN: ${JSON.stringify(payload)}`);
+                return;
+            }
 
-                    // If it's a vehicle status update, also update main states
-                    if (payload.type === 'vehicleStatus' || !payload.type) {
-                        this.json2iob.parse(id, payload.data, {
-                            forceIndex: true,
-                            descriptions,
-                            states,
-                        });
-                    }
-                } else {
-                    // Direct data without wrapper
-                    this.json2iob.parse(`${id}.mqtt`, payload, {
-                        forceIndex: true,
-                        descriptions,
-                        states,
-                    });
-                }
+            const id = vin.toString().replace(this.FORBIDDEN_CHARS, '_');
+
+            if (eventType === 'vehicleInfo') {
+                // Vehicle info update - main realtime data
+                this.handleMqttVehicleInfo(id, vin, payload);
+            } else if (eventType === 'remoteControl') {
+                // Remote control result
+                this.handleMqttRemoteControl(id, vin, payload);
+            } else if (payload.data) {
+                // Generic data update with wrapper
+                this.log.info(`MQTT update for ${vin}: type=${eventType || 'unknown'}`);
+                const respondData = payload.data?.respondData || payload.data;
+                this.json2iob.parse(`${id}.mqtt`, respondData, {
+                    forceIndex: true,
+                    descriptions,
+                    states,
+                });
             } else {
-                // Generic message without VIN
-                this.log.info(`MQTT message: ${JSON.stringify(payload)}`);
+                // Direct data without wrapper
+                this.log.debug(`MQTT generic message for ${vin}`);
+                this.json2iob.parse(`${id}.mqtt`, payload, {
+                    forceIndex: true,
+                    descriptions,
+                    states,
+                });
             }
         } catch (error) {
             this.log.error(`MQTT message handling error: ${error.message}`);
         }
     }
 
+    /**
+     * Handle MQTT vehicleInfo event - realtime vehicle data
+     *
+     * @param {string} id - ioBroker object ID
+     * @param {string} vin - Vehicle VIN
+     * @param {object} payload - MQTT payload
+     */
+    handleMqttVehicleInfo(id, vin, payload) {
+        // Extract respondData from nested structure
+        const respondData = payload.data?.respondData;
+        if (!respondData || typeof respondData !== 'object') {
+            this.log.debug(`MQTT vehicleInfo without respondData for ${vin}`);
+            return;
+        }
+
+        this.log.info(`MQTT vehicleInfo update for ${vin}`);
+
+        // Update realtime cache
+        this.realtimeCache[vin] = {
+            ...this.realtimeCache[vin],
+            ...respondData,
+            _mqttTimestamp: Date.now(),
+        };
+
+        // Parse into main vehicle states (like HTTP realtime data)
+        this.json2iob.parse(id, respondData, {
+            forceIndex: true,
+            descriptions,
+            states,
+        });
+
+        // Also store raw MQTT data
+        this.json2iob.parse(`${id}.mqtt.vehicleInfo`, respondData, {
+            forceIndex: true,
+            descriptions,
+            states,
+        });
+    }
+
+    /**
+     * Handle MQTT remoteControl event - command result
+     *
+     * @param {string} id - ioBroker object ID
+     * @param {string} vin - Vehicle VIN
+     * @param {object} payload - MQTT payload
+     */
+    handleMqttRemoteControl(id, vin, payload) {
+        const respondData = payload.data?.respondData;
+        if (!respondData || typeof respondData !== 'object') {
+            this.log.debug(`MQTT remoteControl without respondData for ${vin}`);
+            return;
+        }
+
+        const controlState = respondData.controlState;
+        const requestSerial = respondData.requestSerial;
+        const commandType = respondData.commandType || payload.data?.commandType;
+        const message = respondData.message || respondData.msg;
+
+        // controlState: 0=pending, 1=success, 2=failure
+        const success = controlState === 1;
+        const failed = controlState === 2;
+        const statusText = controlState === 0 ? 'pending' : controlState === 1 ? 'success' : 'failure';
+        const msgSuffix = message ? ` (${message})` : '';
+
+        this.log.info(`MQTT remoteControl for ${vin}: ${commandType || 'unknown'} = ${statusText}${msgSuffix}`);
+
+        // Resolve pending waiter if we have a requestSerial match
+        if (requestSerial && this.pendingRemoteControls.has(requestSerial)) {
+            const pending = this.pendingRemoteControls.get(requestSerial);
+            this.pendingRemoteControls.delete(requestSerial);
+
+            if (success || failed) {
+                // Terminal state - resolve the waiter
+                this.log.debug(`MQTT resolved pending command ${requestSerial}: ${statusText}`);
+                pending.resolve({
+                    success,
+                    controlState,
+                    message,
+                    commandType,
+                    source: 'mqtt',
+                });
+            }
+        } else if (!requestSerial && (success || failed)) {
+            // No requestSerial in MQTT - try to match by VIN (last pending for this VIN)
+            for (const [serial, pending] of this.pendingRemoteControls.entries()) {
+                if (pending.vin === vin) {
+                    this.pendingRemoteControls.delete(serial);
+                    this.log.debug(`MQTT resolved pending command by VIN ${vin}: ${statusText}`);
+                    pending.resolve({
+                        success,
+                        controlState,
+                        message,
+                        commandType,
+                        source: 'mqtt',
+                    });
+                    break;
+                }
+            }
+        }
+
+        // Store control result
+        this.json2iob.parse(`${id}.mqtt.remoteControl`, respondData, {
+            forceIndex: true,
+            descriptions,
+            states,
+        });
+
+        // Update HVAC state if climate command completed successfully
+        if (success && commandType) {
+            const cmdUpper = String(commandType).toUpperCase();
+            if (cmdUpper === 'CLOSEAIR') {
+                this.setStateAsync(`${id}.hvac.status`, 0, true).catch(() => {});
+                this.setStateAsync(`${id}.hvac.acSwitch`, 0, true).catch(() => {});
+            } else if (cmdUpper === 'OPENAIR') {
+                this.setStateAsync(`${id}.hvac.status`, 2, true).catch(() => {});
+            }
+        }
+    }
+
+    /**
+     * Wait for MQTT remote control result with timeout
+     *
+     * @param {string} requestSerial - Request serial from HTTP trigger
+     * @param {string} vin - Vehicle VIN
+     * @param {string} commandType - Command type for logging
+     * @returns {Promise<object|null>} Result or null on timeout
+     */
+    waitForMqttResult(requestSerial, vin, commandType) {
+        if (!this.mqttClient || !requestSerial) {
+            return Promise.resolve(null);
+        }
+
+        return new Promise(resolve => {
+            const timeout = setTimeout(() => {
+                if (this.pendingRemoteControls.has(requestSerial)) {
+                    this.pendingRemoteControls.delete(requestSerial);
+                    this.log.debug(`MQTT timeout for ${commandType} (${requestSerial}), falling back to HTTP`);
+                    resolve(null);
+                }
+            }, this.mqttCommandTimeout);
+
+            this.pendingRemoteControls.set(requestSerial, {
+                resolve: result => {
+                    clearTimeout(timeout);
+                    resolve(result);
+                },
+                vin,
+                commandType,
+                timestamp: Date.now(),
+            });
+        });
+    }
+
+    /**
+     * Verify control password (PIN) for remote commands
+     * Call this before first remote command to check if PIN is valid
+     *
+     * @param {string} vin - Vehicle identification number
+     */
+    async verifyControlPassword(vin) {
+        if (!this.session) {
+            return { success: false, error: 'No session' };
+        }
+
+        if (!this.config.controlPin) {
+            this.log.error('Control PIN not configured - please set in adapter settings');
+            return { success: false, error: 'No control PIN configured' };
+        }
+
+        const req = bydapi.buildVerifyControlPasswordRequest(
+            this.session,
+            this.config.countryCode,
+            this.config.language,
+            this.deviceConfig,
+            vin,
+            this.config.controlPin,
+        );
+
+        try {
+            const res = await this.requestClient({
+                method: 'post',
+                url: `${bydapi.BASE_URL}/vehicle/vehicleswitch/verifyControlPassword`,
+                headers: {
+                    'User-Agent': bydapi.USER_AGENT,
+                    'Content-Type': 'application/json; charset=UTF-8',
+                },
+                data: { request: bydapi.encodeEnvelope(req.outer) },
+            });
+
+            this.log.debug(`Verify control password response: ${JSON.stringify(res.data)}`);
+            const decoded = bydapi.decodeEnvelope(res.data);
+
+            if (decoded.code !== '0') {
+                if (bydapi.isNoPinSetError(decoded.code)) {
+                    // 5011: No PIN set in BYD app - this is a user setup issue
+                    const errMsg = bydapi.getControlPasswordErrorMessage(decoded.code);
+                    this.log.error(`Control PIN verification failed: ${errMsg}`);
+                    this.log.error('You must first set a Remote Control Password in the BYD app');
+                    this.log.error('BYD App > Settings > Security > Remote Control Password');
+                    return { success: false, error: errMsg, noPinInApp: true };
+                }
+                if (bydapi.isControlPasswordError(decoded.code)) {
+                    const errMsg = bydapi.getControlPasswordErrorMessage(decoded.code);
+                    this.log.error(`Control PIN verification failed: ${errMsg}`);
+                    return { success: false, error: errMsg };
+                }
+                this.log.error(`Control PIN verification failed: code=${decoded.code}`);
+                return { success: false, error: `API error: ${decoded.code}` };
+            }
+
+            if (decoded.respondData) {
+                const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
+                this.log.debug(`Control password verification result: ${JSON.stringify(data)}`);
+                if (data.ok === true) {
+                    this.log.info('Control password verified successfully');
+                    return { success: true };
+                }
+            }
+
+            return { success: true };
+        } catch (error) {
+            this.log.error(`Control password verification error: ${error.message}`);
+            return { success: false, error: error.message };
+        }
+    }
+
+    /**
+     * Toggle smart charging on/off
+     *
+     * @param {string} vin - Vehicle identification number
+     * @param {boolean} enable - True to enable, false to disable
+     */
+    async toggleSmartCharging(vin, enable) {
+        if (!this.session) {
+            return { success: false, error: 'No session' };
+        }
+
+        const req = bydapi.buildSmartChargingToggleRequest(
+            this.session,
+            this.config.countryCode,
+            this.config.language,
+            this.deviceConfig,
+            vin,
+            enable,
+        );
+
+        try {
+            const res = await this.requestClient({
+                method: 'post',
+                url: `${bydapi.BASE_URL}/control/smartCharge/changeChargeStatue`,
+                headers: {
+                    'User-Agent': bydapi.USER_AGENT,
+                    'Content-Type': 'application/json; charset=UTF-8',
+                },
+                data: { request: bydapi.encodeEnvelope(req.outer) },
+            });
+
+            this.log.debug(`Smart charging toggle response: ${JSON.stringify(res.data)}`);
+            const decoded = bydapi.decodeEnvelope(res.data);
+
+            if (decoded.code !== '0') {
+                this.log.error(`Smart charging toggle failed: code=${decoded.code}`);
+                return { success: false, error: `API error: ${decoded.code}` };
+            }
+
+            this.log.info(`Smart charging ${enable ? 'enabled' : 'disabled'} successfully`);
+            return { success: true };
+        } catch (error) {
+            this.log.error(`Smart charging toggle error: ${error.message}`);
+            return { success: false, error: error.message };
+        }
+    }
+
+    /**
+     * Save smart charging schedule
+     *
+     * @param {string} vin - Vehicle identification number
+     * @param {number} targetSoc - Target state of charge (0-100)
+     * @param {number} startHour - Start hour (0-23)
+     * @param {number} startMinute - Start minute (0-59)
+     * @param {number} endHour - End hour (0-23)
+     * @param {number} endMinute - End minute (0-59)
+     */
+    async saveChargingSchedule(vin, targetSoc, startHour, startMinute, endHour, endMinute) {
+        if (!this.session) {
+            return { success: false, error: 'No session' };
+        }
+
+        const req = bydapi.buildSmartChargingScheduleRequest(
+            this.session,
+            this.config.countryCode,
+            this.config.language,
+            this.deviceConfig,
+            vin,
+            targetSoc,
+            startHour,
+            startMinute,
+            endHour,
+            endMinute,
+        );
+
+        try {
+            const res = await this.requestClient({
+                method: 'post',
+                url: `${bydapi.BASE_URL}/control/smartCharge/saveOrUpdate`,
+                headers: {
+                    'User-Agent': bydapi.USER_AGENT,
+                    'Content-Type': 'application/json; charset=UTF-8',
+                },
+                data: { request: bydapi.encodeEnvelope(req.outer) },
+            });
+
+            this.log.debug(`Charging schedule save response: ${JSON.stringify(res.data)}`);
+            const decoded = bydapi.decodeEnvelope(res.data);
+
+            if (decoded.code !== '0') {
+                this.log.error(`Charging schedule save failed: code=${decoded.code}`);
+                return { success: false, error: `API error: ${decoded.code}` };
+            }
+
+            this.log.info(
+                `Charging schedule saved: ${startHour}:${startMinute} - ${endHour}:${endMinute}, target SOC ${targetSoc}%`,
+            );
+            return { success: true };
+        } catch (error) {
+            this.log.error(`Charging schedule save error: ${error.message}`);
+            return { success: false, error: error.message };
+        }
+    }
+
+    /**
+     * Send remote control command with MQTT-first pattern
+     * 1. Trigger via HTTP, get requestSerial
+     * 2. Wait for MQTT result (8s timeout)
+     * 3. Fall back to HTTP polling only if MQTT times out
+     *
+     * @param {string} vin - Vehicle VIN
+     * @param {string} commandType - Command type (LOCKDOOR, OPENDOOR, etc.)
+     * @param {object|null} controlParamsMap - Optional command parameters
+     * @param {number} retryCount - Internal retry counter
+     */
     async sendRemoteControl(vin, commandType, controlParamsMap = null, retryCount = 0) {
         if (!this.session) {
             return { success: false, error: 'No session' };
@@ -900,7 +1287,7 @@ class Byd extends utils.Adapter {
         const MAX_RATE_LIMIT_RETRIES = 3;
         const RATE_LIMIT_DELAY_MS = 5000;
 
-        // Trigger remote control
+        // Step 1: Trigger remote control via HTTP
         const triggerReq = bydapi.buildRemoteControlRequest(
             this.session,
             this.config.countryCode,
@@ -913,89 +1300,99 @@ class Byd extends utils.Adapter {
         );
 
         let requestSerial = null;
-        let shouldRetry = false;
-        let errorCode = null;
+        let triggerError = null;
 
-        await this.requestClient({
-            method: 'post',
-            url: `${bydapi.BASE_URL}/control/remoteControl`,
-            headers: {
-                'User-Agent': bydapi.USER_AGENT,
-                'Content-Type': 'application/json; charset=UTF-8',
-            },
-            data: { request: bydapi.encodeEnvelope(triggerReq.outer) },
-        })
-            .then(async res => {
-                this.log.debug(`Remote control trigger response: ${JSON.stringify(res.data)}`);
-                const decoded = bydapi.decodeEnvelope(res.data);
-                errorCode = decoded.code;
-
-                // Sample trigger response: { "requestSerial": "20250612000000000012345678" }
-                if (decoded.code !== '0') {
-                    // Check for control password errors
-                    if (bydapi.isControlPasswordError(decoded.code)) {
-                        const errMsg = bydapi.getControlPasswordErrorMessage(decoded.code);
-                        this.log.error(`Remote control failed: ${errMsg}`);
-                        return;
-                    }
-
-                    // Check for rate limit - retry after delay
-                    if (bydapi.isRateLimited(decoded.code)) {
-                        this.log.warn(
-                            `Remote control rate limited (code=${decoded.code}), attempt ${retryCount + 1}/${MAX_RATE_LIMIT_RETRIES}`,
-                        );
-                        if (retryCount < MAX_RATE_LIMIT_RETRIES) {
-                            shouldRetry = true;
-                        } else {
-                            this.log.error(
-                                `Remote control failed: rate limit exceeded after ${MAX_RATE_LIMIT_RETRIES} retries`,
-                            );
-                        }
-                        return;
-                    }
-
-                    // Check for session expired
-                    if (bydapi.isSessionExpired(decoded.code)) {
-                        this.log.warn(
-                            `Session expired during remote control (code=${decoded.code}) - re-authenticating`,
-                        );
-                        this.session = null;
-                        await this.login();
-                        if (this.session && retryCount < 1) {
-                            shouldRetry = true;
-                        }
-                        return;
-                    }
-
-                    this.log.error(`Remote control failed: code=${decoded.code} message=${decoded.message || ''}`);
-                } else if (decoded.respondData) {
-                    const data = bydapi.decryptResponseData(decoded.respondData, triggerReq.contentKey);
-                    requestSerial = data.requestSerial || null;
-                    this.log.debug(`Remote control triggered, requestSerial: ${requestSerial}`);
-                }
-            })
-            .catch(error => {
-                this.log.error(`Remote control error: ${error.message}`);
-                error.response && this.log.error(JSON.stringify(error.response.data));
+        try {
+            const res = await this.requestClient({
+                method: 'post',
+                url: `${bydapi.BASE_URL}/control/remoteControl`,
+                headers: {
+                    'User-Agent': bydapi.USER_AGENT,
+                    'Content-Type': 'application/json; charset=UTF-8',
+                },
+                data: { request: bydapi.encodeEnvelope(triggerReq.outer) },
             });
 
-        // Handle retry for rate limit or session expired
-        if (shouldRetry) {
-            const delay = bydapi.isRateLimited(errorCode) ? RATE_LIMIT_DELAY_MS : 1000;
-            this.log.info(`Retrying remote control in ${delay}ms...`);
-            await this.sleep(delay);
-            return this.sendRemoteControl(vin, commandType, controlParamsMap, retryCount + 1);
+            this.log.debug(`Remote control trigger response: ${JSON.stringify(res.data)}`);
+            const decoded = bydapi.decodeEnvelope(res.data);
+
+            if (decoded.code !== '0') {
+                // Handle specific error codes
+                if (bydapi.isControlPasswordError(decoded.code)) {
+                    const errMsg = bydapi.getControlPasswordErrorMessage(decoded.code);
+                    this.log.error(`Remote control failed: ${errMsg}`);
+                    return { success: false, error: errMsg };
+                }
+
+                if (bydapi.isRateLimited(decoded.code)) {
+                    if (retryCount < MAX_RATE_LIMIT_RETRIES) {
+                        this.log.warn(`Rate limited, retry ${retryCount + 1}/${MAX_RATE_LIMIT_RETRIES}`);
+                        await this.sleep(RATE_LIMIT_DELAY_MS);
+                        return this.sendRemoteControl(vin, commandType, controlParamsMap, retryCount + 1);
+                    }
+                    return { success: false, error: 'Rate limit exceeded' };
+                }
+
+                if (bydapi.isSessionExpired(decoded.code)) {
+                    this.log.warn('Session expired, re-authenticating...');
+                    this.session = null;
+                    await this.login();
+                    if (this.session && retryCount < 1) {
+                        return this.sendRemoteControl(vin, commandType, controlParamsMap, retryCount + 1);
+                    }
+                    return { success: false, error: 'Session expired' };
+                }
+
+                triggerError = `API error: ${decoded.code}`;
+            } else if (decoded.respondData) {
+                const data = bydapi.decryptResponseData(decoded.respondData, triggerReq.contentKey);
+                requestSerial = data.requestSerial || null;
+                this.log.debug(`Remote control triggered, requestSerial: ${requestSerial}`);
+            }
+        } catch (error) {
+            this.log.error(`Remote control trigger error: ${error.message}`);
+            return { success: false, error: error.message };
+        }
+
+        if (triggerError) {
+            this.log.error(`Remote control failed: ${triggerError}`);
+            return { success: false, error: triggerError };
         }
 
         if (!requestSerial) {
-            return;
+            this.log.warn('No requestSerial received from trigger');
+            return { success: false, error: 'No requestSerial' };
         }
 
-        // Poll for result (up to 10 attempts)
-        // Sample poll response: { "requestSerial": "...", "controlState": "1", "vin": "LGXXX..." }
-        // controlState: 0=pending, 1=success, 2=failed
-        for (let attempt = 0; attempt < 10; attempt++) {
-            await this.sleep(1500);
+        // Step 2: Wait for MQTT result (MQTT-first pattern)
+        this.log.debug(`Waiting for MQTT result (${this.mqttCommandTimeout}ms timeout)...`);
+        const mqttResult = await this.waitForMqttResult(requestSerial, vin, commandType);
+
+        if (mqttResult) {
+            // Got result via MQTT - fast path!
+            this.log.info(`Remote control ${commandType}: ${mqttResult.success ? 'success' : 'failed'} (via MQTT)`);
+            return mqttResult;
+        }
+
+        // Step 3: MQTT timeout - fall back to HTTP polling
+        this.log.debug('MQTT timeout, falling back to HTTP polling...');
+        return this.pollRemoteControlResult(vin, commandType, requestSerial, triggerReq.contentKey);
+    }
+
+    /**
+     * Poll for remote control result via HTTP (fallback when MQTT times out)
+     *
+     * @param {string} vin - Vehicle VIN
+     * @param {string} commandType - Command type
+     * @param {string} requestSerial - Request serial from trigger
+     * @param {string} contentKey - Content key for decryption
+     */
+    async pollRemoteControlResult(vin, commandType, requestSerial, contentKey) {
+        const MAX_POLL_ATTEMPTS = 10;
+        const POLL_INTERVAL_MS = 1500;
+
+        for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
+            await this.sleep(POLL_INTERVAL_MS);
 
             const pollReq = bydapi.buildRemoteControlRequest(
                 this.session,
@@ -1009,43 +1406,44 @@ class Byd extends utils.Adapter {
                 requestSerial,
             );
 
-            let ready = false;
-
-            await this.requestClient({
-                method: 'post',
-                url: `${bydapi.BASE_URL}/control/remoteControlResult`,
-                headers: {
-                    'User-Agent': bydapi.USER_AGENT,
-                    'Content-Type': 'application/json; charset=UTF-8',
-                },
-                data: { request: bydapi.encodeEnvelope(pollReq.outer) },
-            })
-                .then(async res => {
-                    this.log.debug(`Remote control poll response: ${JSON.stringify(res.data)}`);
-                    const decoded = bydapi.decodeEnvelope(res.data);
-                    if (decoded.code === '0' && decoded.respondData) {
-                        const data = bydapi.decryptResponseData(decoded.respondData, pollReq.contentKey);
-                        this.log.debug(`Remote control result: ${JSON.stringify(data)}`);
-
-                        if (bydapi.isRemoteControlReady(data)) {
-                            const success = data.controlState === '1' || data.controlState === 1;
-                            if (success) {
-                                this.log.info(`Remote control success: ${commandType}`);
-                            } else {
-                                this.log.warn(`Remote control completed with state: ${data.controlState}`);
-                            }
-                            ready = true;
-                        }
-                    }
-                })
-                .catch(error => {
-                    this.log.error(`Remote control poll error: ${error.message}`);
+            try {
+                const res = await this.requestClient({
+                    method: 'post',
+                    url: `${bydapi.BASE_URL}/control/remoteControlResult`,
+                    headers: {
+                        'User-Agent': bydapi.USER_AGENT,
+                        'Content-Type': 'application/json; charset=UTF-8',
+                    },
+                    data: { request: bydapi.encodeEnvelope(pollReq.outer) },
                 });
 
-            if (ready) {
-                break;
+                this.log.debug(`Remote control poll ${attempt + 1}/${MAX_POLL_ATTEMPTS}: ${JSON.stringify(res.data)}`);
+                const decoded = bydapi.decodeEnvelope(res.data);
+
+                if (decoded.code === '0' && decoded.respondData) {
+                    const data = bydapi.decryptResponseData(decoded.respondData, pollReq.contentKey || contentKey);
+
+                    if (bydapi.isRemoteControlReady(data)) {
+                        const controlState = parseInt(data.controlState, 10);
+                        const success = controlState === 1;
+                        const statusText = success ? 'success' : 'failed';
+
+                        this.log.info(`Remote control ${commandType}: ${statusText} (via HTTP poll)`);
+                        return {
+                            success,
+                            controlState,
+                            message: data.message || data.msg,
+                            source: 'http',
+                        };
+                    }
+                }
+            } catch (error) {
+                this.log.debug(`Poll attempt ${attempt + 1} error: ${error.message}`);
             }
         }
+
+        this.log.warn(`Remote control ${commandType}: timeout after ${MAX_POLL_ATTEMPTS} poll attempts`);
+        return { success: false, error: 'Polling timeout' };
     }
 
     async onStateChange(id, state) {
@@ -1065,7 +1463,8 @@ class Byd extends utils.Adapter {
         // Handle ack===false for commands
         if (!state.ack && folder === 'remote') {
             if (command === 'refresh') {
-                this.updateVehicles();
+                this.log.info(`Manual refresh requested for ${deviceId}`);
+                await this.updateSingleVehicle(deviceId);
                 await this.setStateAsync(id, false, true);
                 return;
             }
@@ -1075,30 +1474,22 @@ class Byd extends utils.Adapter {
                 this.log.info(`Sending climate command: ${state.val ? 'ON' : 'OFF'} for ${deviceId}`);
 
                 if (state.val) {
-                    // Climate ON
-                    const controlParamsMap = {
-                        airSet: null,
-                        remoteMode: 4,
-                        timeSpan: 1,
-                        mainSettingTemp: 7,
-                        copilotSettingTemp: 7,
-                        cycleMode: 2,
-                        airAccuracy: 1,
+                    // Climate ON - use helper for params
+                    const controlParamsMap = bydapi.buildClimateParams({
+                        temp: 7, // 21°C (scale 1-17 = 15-31°C)
+                        copilotTemp: 7,
+                        timeSpan: 1, // 10 minutes
                         airConditioningMode: 1,
-                    };
+                    });
                     await this.sendRemoteControl(deviceId, 'OPENAIR', controlParamsMap);
                 } else {
                     // Climate OFF
-                    const controlParamsMap = {
-                        airSet: null,
-                        remoteMode: 4,
+                    const controlParamsMap = bydapi.buildClimateParams({
+                        temp: 7,
+                        copilotTemp: 7,
                         timeSpan: 0,
-                        mainSettingTemp: 7,
-                        copilotSettingTemp: 7,
-                        cycleMode: 2,
-                        airAccuracy: 1,
                         airConditioningMode: 0,
-                    };
+                    });
                     await this.sendRemoteControl(deviceId, 'CLOSEAIR', controlParamsMap);
                 }
 
@@ -1114,23 +1505,11 @@ class Byd extends utils.Adapter {
             if (command === 'seatHeat') {
                 this.log.info(`Sending seat heating command: ${state.val ? 'ON' : 'OFF'} for ${deviceId}`);
 
-                const controlParamsMap = {
-                    chairType: '5',
-                    remoteMode: state.val ? 1 : 0,
+                const controlParamsMap = bydapi.buildSeatClimateParams({
                     mainHeat: state.val ? 3 : 0,
-                    mainVentilation: 0,
                     copilotHeat: state.val ? 3 : 0,
-                    copilotVentilation: 0,
-                    lrSeatHeatState: 0,
-                    lrSeatVentilationState: 0,
-                    lrThirdHeatState: 0,
-                    lrThirdVentilationState: 0,
-                    rrSeatHeatState: 0,
-                    rrSeatVentilationState: 0,
-                    rrThirdHeatState: 0,
-                    rrThirdVentilationState: 0,
-                    steeringWheelHeatState: state.val ? 1 : 0,
-                };
+                    steeringWheelHeat: state.val ? 1 : 0,
+                });
                 await this.sendRemoteControl(deviceId, 'VENTILATIONHEATING', controlParamsMap);
 
                 await this.setStateAsync(id, state.val, true);
@@ -1138,6 +1517,36 @@ class Byd extends utils.Adapter {
                 this.refreshTimeout = setTimeout(() => {
                     this.updateVehicles();
                 }, 10 * 1000);
+                return;
+            }
+
+            // Battery heating uses BATTERYHEAT commandType
+            if (command === 'batteryHeat') {
+                this.log.info(`Sending battery heating command: ${state.val ? 'ON' : 'OFF'} for ${deviceId}`);
+
+                const controlParamsMap = bydapi.buildBatteryHeatParams(state.val);
+                await this.sendRemoteControl(deviceId, 'BATTERYHEAT', controlParamsMap);
+
+                await this.setStateAsync(id, state.val, true);
+                this.refreshTimeout && clearTimeout(this.refreshTimeout);
+                this.refreshTimeout = setTimeout(() => {
+                    this.updateVehicles();
+                }, 10 * 1000);
+                return;
+            }
+
+            // Verify control PIN (manual trigger)
+            if (command === 'verifyPin') {
+                if (state.val) {
+                    this.log.info(`Verifying control PIN for ${deviceId}`);
+                    const result = await this.verifyControlPassword(deviceId);
+                    if (result.success) {
+                        this.log.info('Control PIN verified successfully');
+                    } else {
+                        this.log.error(`Control PIN verification failed: ${result.error}`);
+                    }
+                }
+                await this.setStateAsync(id, false, true);
                 return;
             }
 

@@ -80,8 +80,7 @@
         "password": "",
         "controlPin": "",
         "countryCode": "DE",
-        "language": "en",
-        "interval": 300
+        "language": "en"
     },
     "encryptedNative": ["password", "controlPin"],
     "protectedNative": ["password", "controlPin"],
