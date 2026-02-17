@@ -808,18 +808,22 @@ class Byd extends utils.Adapter {
             const messageStr = message.toString();
             this.log.debug(`MQTT message on ${topic}: ${messageStr}`);
 
-            // Try to parse as JSON, otherwise decrypt if hex-encoded
+            // pyBYD approach: strip whitespace first, then always try to decrypt
+            // MQTT messages are hex-encoded AES-encrypted payloads
+            const stripped = messageStr.replace(/\s+/g, '');
+
             let payload;
-            try {
-                payload = JSON.parse(messageStr);
-            } catch {
-                // Message might be encrypted hex string
-                if (/^[0-9A-Fa-f]+$/.test(messageStr) && this.session?.encryToken) {
-                    const decrypted = bydapi.decryptMqttPayload(messageStr, this.session.encryToken);
-                    payload = JSON.parse(decrypted);
-                    this.log.debug(`MQTT decrypted: ${JSON.stringify(payload)}`);
-                } else {
-                    this.log.debug(`MQTT raw message: ${messageStr}`);
+            if (/^[0-9A-Fa-f]+$/.test(stripped) && this.session?.encryToken) {
+                // Hex-encoded encrypted message
+                const decrypted = bydapi.decryptMqttPayload(stripped, this.session.encryToken);
+                payload = JSON.parse(decrypted);
+                this.log.debug(`MQTT decrypted: ${JSON.stringify(payload)}`);
+            } else {
+                // Try to parse as plain JSON (fallback)
+                try {
+                    payload = JSON.parse(messageStr);
+                } catch {
+                    this.log.debug(`MQTT raw message (not hex, not JSON): ${messageStr.substring(0, 100)}`);
                     return;
                 }
             }
