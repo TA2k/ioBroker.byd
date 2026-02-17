@@ -183,6 +183,8 @@ class Byd extends utils.Adapter {
      * 1. HTTP trigger -> get requestSerial
      * 2. Wait for MQTT vehicleInfo event (8s timeout)
      * 3. Fall back to HTTP polling if MQTT doesn't deliver
+     *
+     * @param {string} vin - Vehicle identification number
      */
     async pollVehicleRealtimeWithMqtt(vin) {
         if (!this.session) {
@@ -251,6 +253,9 @@ class Byd extends utils.Adapter {
 
     /**
      * Wait for MQTT vehicleInfo event with timeout
+     *
+     * @param {string} vin - Vehicle identification number
+     * @param {string} requestSerial - Request serial from trigger response
      */
     waitForMqttVehicleInfo(vin, requestSerial) {
         return new Promise(resolve => {
@@ -274,6 +279,10 @@ class Byd extends utils.Adapter {
 
     /**
      * HTTP polling fallback for realtime data
+     *
+     * @param {string} vin - Vehicle identification number
+     * @param {string} requestSerial - Request serial from trigger response
+     * @param {string} contentKey - AES content key for decryption
      */
     async pollRealtimeHttpFallback(vin, requestSerial, contentKey) {
         for (let attempt = 0; attempt < 10; attempt++) {
@@ -317,6 +326,9 @@ class Byd extends utils.Adapter {
 
     /**
      * Process realtime data - update cache and states
+     *
+     * @param {string} vin - Vehicle identification number
+     * @param {object} data - Realtime data from API response
      */
     processRealtimeData(vin, data) {
         this.realtimeCache[vin] = data;
@@ -359,6 +371,8 @@ class Byd extends utils.Adapter {
 
     /**
      * Check if vehicle is on based on realtime data
+     *
+     * @param {object} data - Realtime data from API response
      */
     isVehicleOn(data) {
         // Vehicle is considered "on" if engine is running or speed > 0
@@ -376,6 +390,8 @@ class Byd extends utils.Adapter {
 
     /**
      * Poll GPS with MQTT-first pattern
+     *
+     * @param {string} vin - Vehicle identification number
      */
     async pollGpsWithMqtt(vin) {
         if (!this.session) {
@@ -444,6 +460,9 @@ class Byd extends utils.Adapter {
 
     /**
      * Wait for MQTT GPS event with timeout
+     *
+     * @param {string} vin - Vehicle identification number
+     * @param {string} requestSerial - Request serial from trigger response
      */
     waitForMqttGps(vin, requestSerial) {
         return new Promise(resolve => {
@@ -467,6 +486,10 @@ class Byd extends utils.Adapter {
 
     /**
      * HTTP polling fallback for GPS data
+     *
+     * @param {string} vin - Vehicle identification number
+     * @param {string} requestSerial - Request serial from trigger response
+     * @param {string} contentKey - AES content key for decryption
      */
     async pollGpsHttpFallback(vin, requestSerial, contentKey) {
         for (let attempt = 0; attempt < 10; attempt++) {
@@ -510,6 +533,9 @@ class Byd extends utils.Adapter {
 
     /**
      * Process GPS data - update states
+     *
+     * @param {string} vin - Vehicle identification number
+     * @param {object} data - GPS data from API response
      */
     processGpsData(vin, data) {
         // GPS response can have nested data structure

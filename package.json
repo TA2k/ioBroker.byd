@@ -1,6 +1,6 @@
 {
   "name": "iobroker.byd",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "iobroker Adapter for BYD cars",
   "author": {
     "name": "TA2k",
