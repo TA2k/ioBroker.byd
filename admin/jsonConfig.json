@@ -99,6 +99,90 @@
             },
             "newLine": true,
             "sm": 3
+        },
+        "_pollHeader": {
+            "type": "header",
+            "text": {
+                "en": "Polling Settings",
+                "de": "Polling-Einstellungen"
+            },
+            "size": 3,
+            "newLine": true
+        },
+        "pollInterval": {
+            "type": "number",
+            "label": {
+                "en": "Telemetry Poll Interval (seconds)",
+                "de": "Telemetrie-Abfrageintervall (Sekunden)"
+            },
+            "help": {
+                "en": "How often to fetch vehicle data (30-900 seconds)",
+                "de": "Wie oft Fahrzeugdaten abgerufen werden (30-900 Sekunden)"
+            },
+            "min": 30,
+            "max": 900,
+            "newLine": true,
+            "sm": 4
+        },
+        "gpsPollInterval": {
+            "type": "number",
+            "label": {
+                "en": "GPS Poll Interval (seconds)",
+                "de": "GPS-Abfrageintervall (Sekunden)"
+            },
+            "help": {
+                "en": "How often to fetch GPS location (30-900 seconds)",
+                "de": "Wie oft GPS-Position abgerufen wird (30-900 Sekunden)"
+            },
+            "min": 30,
+            "max": 900,
+            "newLine": true,
+            "sm": 4
+        },
+        "smartGpsPolling": {
+            "type": "checkbox",
+            "label": {
+                "en": "Smart GPS Polling",
+                "de": "Intelligentes GPS-Polling"
+            },
+            "help": {
+                "en": "Poll GPS more frequently when vehicle is on (driving)",
+                "de": "GPS häufiger abfragen wenn Fahrzeug an ist (fährt)"
+            },
+            "newLine": true,
+            "sm": 4
+        },
+        "gpsActiveInterval": {
+            "type": "number",
+            "label": {
+                "en": "GPS Active Interval (seconds)",
+                "de": "GPS-Intervall aktiv (Sekunden)"
+            },
+            "help": {
+                "en": "GPS interval when vehicle is on (10-300 seconds)",
+                "de": "GPS-Intervall wenn Fahrzeug an (10-300 Sekunden)"
+            },
+            "min": 10,
+            "max": 300,
+            "hidden": "!data.smartGpsPolling",
+            "newLine": true,
+            "sm": 4
+        },
+        "gpsInactiveInterval": {
+            "type": "number",
+            "label": {
+                "en": "GPS Inactive Interval (seconds)",
+                "de": "GPS-Intervall inaktiv (Sekunden)"
+            },
+            "help": {
+                "en": "GPS interval when vehicle is off (60-3600 seconds)",
+                "de": "GPS-Intervall wenn Fahrzeug aus (60-3600 Sekunden)"
+            },
+            "min": 60,
+            "max": 3600,
+            "hidden": "!data.smartGpsPolling",
+            "newLine": true,
+            "sm": 4
         }
     }
 }

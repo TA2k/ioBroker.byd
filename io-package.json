@@ -80,7 +80,12 @@
         "password": "",
         "controlPin": "",
         "countryCode": "DE",
-        "language": "en"
+        "language": "en",
+        "pollInterval": 300,
+        "gpsPollInterval": 300,
+        "smartGpsPolling": false,
+        "gpsActiveInterval": 30,
+        "gpsInactiveInterval": 600
     },
     "encryptedNative": ["password", "controlPin"],
     "protectedNative": ["password", "controlPin"],

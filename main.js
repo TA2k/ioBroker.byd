@@ -24,7 +24,8 @@ class Byd extends utils.Adapter {
 
         this.vehicleArray = [];
         this.json2iob = new Json2iob(this);
-        this.updateInterval = null;
+        this.telemetryInterval = null;
+        this.gpsInterval = null;
         this.refreshTimeout = null;
         this.session = null;
         this.deviceConfig = bydapi.DEFAULT_DEVICE_CONFIG;
@@ -32,14 +33,19 @@ class Byd extends utils.Adapter {
         this.unsupportedEndpoints = {}; // { vin: Set(['energy', 'hvac', 'charging']) }
         // Cache realtime data for fallback
         this.realtimeCache = {}; // { vin: {...} }
+        // Track vehicle on/off state for smart GPS polling
+        this.vehicleOnState = {}; // { vin: boolean }
         // MQTT client for push notifications
         this.mqttClient = null;
         this.mqttBroker = null;
+        // Pending MQTT waiters for trigger+wait pattern
+        // Map: requestSerial -> { resolve, reject, vin, type, timestamp }
+        this.pendingMqttWaiters = new Map();
         // Pending remote control commands waiting for MQTT result
         // Map: requestSerial -> { resolve, reject, vin, command, timestamp }
         this.pendingRemoteControls = new Map();
-        // MQTT command timeout in ms (pyBYD uses 8 seconds)
-        this.mqttCommandTimeout = 8000;
+        // MQTT wait timeout in ms (pyBYD uses 8 seconds for commands)
+        this.mqttWaitTimeout = 8000;
 
         const jar = new CookieJar();
         this.requestClient = wrapper(
@@ -91,26 +97,429 @@ class Byd extends utils.Adapter {
             this.log.warn('Remote control commands require a PIN (same as in BYD app)');
         }
 
-        // Initial data fetch via HTTP (once at startup)
-        await this.updateVehicles();
-
-        // Connect MQTT for real-time updates (primary data source)
+        // Connect MQTT for real-time updates
         await this.connectMqtt();
 
-        // MQTT-first architecture:
-        // - MQTT provides real-time updates (vehicleInfo events)
-        // - HTTP only as fallback every 30 minutes for consistency
-        // - Use remote.refresh button for manual updates
-        const HTTP_FALLBACK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
-        this.log.info('MQTT provides real-time updates, HTTP fallback every 30 minutes');
-        this.updateInterval = setInterval(() => {
-            if (this.mqttClient?.connected) {
-                this.log.debug('Skipping scheduled HTTP update - MQTT connected');
+        // Initial data fetch
+        await this.updateVehicles();
+
+        // Start polling intervals (like Home Assistant integration)
+        this.startPolling();
+    }
+
+    /**
+     * Start telemetry and GPS polling intervals.
+     * Pattern: HTTP trigger -> wait for MQTT -> HTTP poll fallback
+     */
+    startPolling() {
+        const pollInterval = Math.max(30, Math.min(900, this.config.pollInterval || 300));
+        const gpsPollInterval = Math.max(30, Math.min(900, this.config.gpsPollInterval || 300));
+
+        this.log.info(`Telemetry poll interval: ${pollInterval}s, GPS poll interval: ${gpsPollInterval}s`);
+        if (this.config.smartGpsPolling) {
+            this.log.info(
+                `Smart GPS polling enabled: active=${this.config.gpsActiveInterval || 30}s, inactive=${this.config.gpsInactiveInterval || 600}s`,
+            );
+        }
+
+        // Telemetry polling
+        this.telemetryInterval = setInterval(() => {
+            this.pollAllVehiclesRealtime();
+        }, pollInterval * 1000);
+
+        // GPS polling (with smart polling support)
+        this.scheduleGpsPolling();
+    }
+
+    /**
+     * Schedule GPS polling with optional smart interval based on vehicle state
+     */
+    scheduleGpsPolling() {
+        if (this.gpsInterval) {
+            clearInterval(this.gpsInterval);
+        }
+
+        let intervalSeconds;
+        if (this.config.smartGpsPolling) {
+            // Check if any vehicle is on
+            const anyVehicleOn = Object.values(this.vehicleOnState).some(v => v === true);
+            intervalSeconds = anyVehicleOn
+                ? Math.max(10, Math.min(300, this.config.gpsActiveInterval || 30))
+                : Math.max(60, Math.min(3600, this.config.gpsInactiveInterval || 600));
+            this.log.debug(`Smart GPS polling: vehicleOn=${anyVehicleOn}, interval=${intervalSeconds}s`);
+        } else {
+            intervalSeconds = Math.max(30, Math.min(900, this.config.gpsPollInterval || 300));
+        }
+
+        this.gpsInterval = setInterval(() => {
+            this.pollAllVehiclesGps();
+            // Re-evaluate interval if smart polling enabled
+            if (this.config.smartGpsPolling) {
+                this.scheduleGpsPolling();
+            }
+        }, intervalSeconds * 1000);
+    }
+
+    /**
+     * Poll realtime data for all vehicles using trigger + MQTT wait + HTTP fallback
+     */
+    async pollAllVehiclesRealtime() {
+        for (const vehicle of this.vehicleArray) {
+            await this.pollVehicleRealtimeWithMqtt(vehicle.vin);
+        }
+    }
+
+    /**
+     * Poll GPS data for all vehicles
+     */
+    async pollAllVehiclesGps() {
+        for (const vehicle of this.vehicleArray) {
+            await this.pollGpsWithMqtt(vehicle.vin);
+        }
+    }
+
+    /**
+     * Poll vehicle realtime with MQTT-first pattern (like pyBYD/HA)
+     * 1. HTTP trigger -> get requestSerial
+     * 2. Wait for MQTT vehicleInfo event (8s timeout)
+     * 3. Fall back to HTTP polling if MQTT doesn't deliver
+     */
+    async pollVehicleRealtimeWithMqtt(vin) {
+        if (!this.session) {
+            return;
+        }
+
+        // Step 1: Trigger request
+        const triggerReq = bydapi.buildVehicleRealtimeRequest(
+            this.session,
+            this.config.countryCode,
+            this.config.language,
+            this.deviceConfig,
+            vin,
+        );
+
+        let requestSerial = null;
+
+        try {
+            const res = await this.requestClient({
+                method: 'post',
+                url: `${bydapi.BASE_URL}/vehicleInfo/vehicle/vehicleRealTimeRequest`,
+                headers: {
+                    'User-Agent': bydapi.USER_AGENT,
+                    'Content-Type': 'application/json; charset=UTF-8',
+                },
+                data: { request: bydapi.encodeEnvelope(triggerReq.outer) },
+            });
+
+            const decoded = bydapi.decodeEnvelope(res.data);
+            if (decoded.code === '0' && decoded.respondData) {
+                const data = bydapi.decryptResponseData(decoded.respondData, triggerReq.contentKey);
+                requestSerial = data.requestSerial || null;
+
+                // If trigger response already has data, use it
+                if (bydapi.isRealtimeDataReady(data)) {
+                    this.log.debug(`Realtime data ready from trigger for ${vin}`);
+                    this.processRealtimeData(vin, data);
+                    return;
+                }
+            }
+        } catch (error) {
+            this.log.error(`Realtime trigger error for ${vin}: ${error.message}`);
+            return;
+        }
+
+        if (!requestSerial) {
+            this.log.warn(`No requestSerial from realtime trigger for ${vin}`);
+            return;
+        }
+
+        // Step 2: Wait for MQTT vehicleInfo event
+        if (this.mqttClient?.connected) {
+            this.log.debug(`Waiting for MQTT vehicleInfo for ${vin} (serial: ${requestSerial})`);
+            const mqttData = await this.waitForMqttVehicleInfo(vin, requestSerial);
+            if (mqttData) {
+                this.log.debug(`Realtime data received via MQTT for ${vin}`);
+                this.processRealtimeData(vin, mqttData);
                 return;
             }
-            this.log.debug('Scheduled HTTP update (MQTT disconnected)');
-            this.updateVehicles();
-        }, HTTP_FALLBACK_INTERVAL_MS);
+            this.log.debug(`MQTT timeout for ${vin}, falling back to HTTP polling`);
+        }
+
+        // Step 3: HTTP poll fallback
+        await this.pollRealtimeHttpFallback(vin, requestSerial, triggerReq.contentKey);
+    }
+
+    /**
+     * Wait for MQTT vehicleInfo event with timeout
+     */
+    waitForMqttVehicleInfo(vin, requestSerial) {
+        return new Promise(resolve => {
+            const timeout = setTimeout(() => {
+                this.pendingMqttWaiters.delete(requestSerial);
+                resolve(null);
+            }, this.mqttWaitTimeout);
+
+            this.pendingMqttWaiters.set(requestSerial, {
+                resolve: data => {
+                    clearTimeout(timeout);
+                    this.pendingMqttWaiters.delete(requestSerial);
+                    resolve(data);
+                },
+                vin,
+                type: 'vehicleInfo',
+                timestamp: Date.now(),
+            });
+        });
+    }
+
+    /**
+     * HTTP polling fallback for realtime data
+     */
+    async pollRealtimeHttpFallback(vin, requestSerial, contentKey) {
+        for (let attempt = 0; attempt < 10; attempt++) {
+            await this.sleep(1500);
+
+            const pollReq = bydapi.buildVehicleRealtimeRequest(
+                this.session,
+                this.config.countryCode,
+                this.config.language,
+                this.deviceConfig,
+                vin,
+                requestSerial,
+            );
+
+            try {
+                const res = await this.requestClient({
+                    method: 'post',
+                    url: `${bydapi.BASE_URL}/vehicleInfo/vehicle/vehicleRealTimeResult`,
+                    headers: {
+                        'User-Agent': bydapi.USER_AGENT,
+                        'Content-Type': 'application/json; charset=UTF-8',
+                    },
+                    data: { request: bydapi.encodeEnvelope(pollReq.outer) },
+                });
+
+                const decoded = bydapi.decodeEnvelope(res.data);
+                if (decoded.code === '0' && decoded.respondData) {
+                    const data = bydapi.decryptResponseData(decoded.respondData, pollReq.contentKey || contentKey);
+                    if (bydapi.isRealtimeDataReady(data)) {
+                        this.log.debug(`Realtime data ready via HTTP poll for ${vin} (attempt ${attempt + 1})`);
+                        this.processRealtimeData(vin, data);
+                        return;
+                    }
+                }
+            } catch (error) {
+                this.log.error(`Realtime poll error for ${vin}: ${error.message}`);
+            }
+        }
+        this.log.warn(`Realtime data not ready after 10 poll attempts for ${vin}`);
+    }
+
+    /**
+     * Process realtime data - update cache and states
+     */
+    processRealtimeData(vin, data) {
+        this.realtimeCache[vin] = data;
+
+        // Update vehicle on/off state for smart GPS polling
+        const wasOn = this.vehicleOnState[vin];
+        const isOn = this.isVehicleOn(data);
+        this.vehicleOnState[vin] = isOn;
+
+        // Re-schedule GPS if vehicle state changed and smart polling enabled
+        if (this.config.smartGpsPolling && wasOn !== isOn) {
+            this.log.debug(`Vehicle ${vin} state changed: ${wasOn} -> ${isOn}, rescheduling GPS`);
+            this.scheduleGpsPolling();
+        }
+
+        // Parse into ioBroker states
+        this.json2iob.parse(`${vin}.status`, data, {
+            forceIndex: true,
+            descriptions,
+            states,
+        });
+
+        // Update remote state buttons based on realtime data
+        if (data.leftFrontDoorLock !== undefined) {
+            const isLocked = data.leftFrontDoorLock === 2;
+            this.log.debug(`Status leftFrontDoorLock=${data.leftFrontDoorLock} -> remote.lock=${isLocked}`);
+            this.setStateAsync(`${vin}.remote.lock`, isLocked, true);
+        }
+        if (data.batteryHeatState !== undefined) {
+            const isOn = data.batteryHeatState > 0;
+            this.log.debug(`Status batteryHeatState=${data.batteryHeatState} -> remote.batteryHeat=${isOn}`);
+            this.setStateAsync(`${vin}.remote.batteryHeat`, isOn, true);
+        }
+        if (data.mainSeatHeatState !== undefined) {
+            const isOn = data.mainSeatHeatState > 0;
+            this.log.debug(`Status mainSeatHeatState=${data.mainSeatHeatState} -> remote.seatHeat=${isOn}`);
+            this.setStateAsync(`${vin}.remote.seatHeat`, isOn, true);
+        }
+    }
+
+    /**
+     * Check if vehicle is on based on realtime data
+     */
+    isVehicleOn(data) {
+        // Vehicle is considered "on" if engine is running or speed > 0
+        if (data.engineStatus === 1) {
+            return true;
+        }
+        if (data.speed > 0) {
+            return true;
+        }
+        if (data.vehicleState === 1) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Poll GPS with MQTT-first pattern
+     */
+    async pollGpsWithMqtt(vin) {
+        if (!this.session) {
+            return;
+        }
+
+        // Trigger GPS request
+        const triggerReq = bydapi.buildGpsInfoRequest(
+            this.session,
+            this.config.countryCode,
+            this.config.language,
+            this.deviceConfig,
+            vin,
+        );
+
+        let requestSerial = null;
+
+        try {
+            const res = await this.requestClient({
+                method: 'post',
+                url: `${bydapi.BASE_URL}/control/getGpsInfo`,
+                headers: {
+                    'User-Agent': bydapi.USER_AGENT,
+                    'Content-Type': 'application/json; charset=UTF-8',
+                },
+                data: { request: bydapi.encodeEnvelope(triggerReq.outer) },
+            });
+
+            const decoded = bydapi.decodeEnvelope(res.data);
+            if (decoded.code === '0' && decoded.respondData) {
+                const data = bydapi.decryptResponseData(decoded.respondData, triggerReq.contentKey);
+                requestSerial = data.requestSerial || null;
+
+                // Check if GPS data is already ready in trigger response
+                if (bydapi.isGpsDataReady(data)) {
+                    this.log.debug(`GPS data ready from trigger for ${vin}`);
+                    this.processGpsData(vin, data);
+                    return;
+                }
+            }
+        } catch (error) {
+            this.log.error(`GPS trigger error for ${vin}: ${error.message}`);
+            return;
+        }
+
+        if (!requestSerial) {
+            this.log.warn(`No requestSerial from GPS trigger for ${vin}`);
+            return;
+        }
+
+        // Wait for MQTT or fall back to HTTP
+        if (this.mqttClient?.connected) {
+            this.log.debug(`Waiting for MQTT GPS for ${vin} (serial: ${requestSerial})`);
+            const mqttData = await this.waitForMqttGps(vin, requestSerial);
+            if (mqttData) {
+                this.log.debug(`GPS data received via MQTT for ${vin}`);
+                this.processGpsData(vin, mqttData);
+                return;
+            }
+            this.log.debug(`MQTT timeout for GPS ${vin}, falling back to HTTP polling`);
+        }
+
+        // HTTP poll fallback
+        await this.pollGpsHttpFallback(vin, requestSerial, triggerReq.contentKey);
+    }
+
+    /**
+     * Wait for MQTT GPS event with timeout
+     */
+    waitForMqttGps(vin, requestSerial) {
+        return new Promise(resolve => {
+            const timeout = setTimeout(() => {
+                this.pendingMqttWaiters.delete(requestSerial);
+                resolve(null);
+            }, this.mqttWaitTimeout);
+
+            this.pendingMqttWaiters.set(requestSerial, {
+                resolve: data => {
+                    clearTimeout(timeout);
+                    this.pendingMqttWaiters.delete(requestSerial);
+                    resolve(data);
+                },
+                vin,
+                type: 'gps',
+                timestamp: Date.now(),
+            });
+        });
+    }
+
+    /**
+     * HTTP polling fallback for GPS data
+     */
+    async pollGpsHttpFallback(vin, requestSerial, contentKey) {
+        for (let attempt = 0; attempt < 10; attempt++) {
+            await this.sleep(1500);
+
+            const pollReq = bydapi.buildGpsInfoRequest(
+                this.session,
+                this.config.countryCode,
+                this.config.language,
+                this.deviceConfig,
+                vin,
+                requestSerial,
+            );
+
+            try {
+                const res = await this.requestClient({
+                    method: 'post',
+                    url: `${bydapi.BASE_URL}/control/getGpsInfoResult`,
+                    headers: {
+                        'User-Agent': bydapi.USER_AGENT,
+                        'Content-Type': 'application/json; charset=UTF-8',
+                    },
+                    data: { request: bydapi.encodeEnvelope(pollReq.outer) },
+                });
+
+                const decoded = bydapi.decodeEnvelope(res.data);
+                if (decoded.code === '0' && decoded.respondData) {
+                    const data = bydapi.decryptResponseData(decoded.respondData, pollReq.contentKey || contentKey);
+                    if (bydapi.isGpsDataReady(data)) {
+                        this.log.debug(`GPS data ready via HTTP poll for ${vin} (attempt ${attempt + 1})`);
+                        this.processGpsData(vin, data);
+                        return;
+                    }
+                }
+            } catch (error) {
+                this.log.error(`GPS poll error for ${vin}: ${error.message}`);
+            }
+        }
+        this.log.warn(`GPS data not ready after 10 poll attempts for ${vin}`);
+    }
+
+    /**
+     * Process GPS data - update states
+     */
+    processGpsData(vin, data) {
+        // GPS response can have nested data structure
+        const gpsData = data.data || data;
+        this.json2iob.parse(`${vin}.status.gps`, gpsData, {
+            forceIndex: true,
+            channelName: 'GPS Location',
+            descriptions,
+            states,
+        });
     }
 
     async loadOrGenerateDeviceConfig() {
@@ -815,9 +1224,16 @@ class Byd extends utils.Adapter {
             let payload;
             if (/^[0-9A-Fa-f]+$/.test(stripped) && this.session?.encryToken) {
                 // Hex-encoded encrypted message
-                const decrypted = bydapi.decryptMqttPayload(stripped, this.session.encryToken);
-                payload = JSON.parse(decrypted);
-                this.log.debug(`MQTT decrypted: ${JSON.stringify(payload)}`);
+                try {
+                    const decrypted = bydapi.decryptMqttPayload(stripped, this.session.encryToken);
+                    payload = JSON.parse(decrypted);
+                    this.log.debug(`MQTT decrypted: ${JSON.stringify(payload)}`);
+                } catch (decryptError) {
+                    // Decrypt failure often means stale encryToken - trigger re-auth (pyBYD pattern)
+                    this.log.warn(`MQTT decrypt failed (${decryptError.message}), triggering re-auth`);
+                    this.handleSessionExpired('decrypt_error', 'MQTT');
+                    return;
+                }
             } else {
                 // Try to parse as plain JSON (fallback)
                 try {
@@ -880,19 +1296,19 @@ class Byd extends utils.Adapter {
 
         this.log.info(`MQTT vehicleInfo update for ${vin}`);
 
-        // Update realtime cache
-        this.realtimeCache[vin] = {
-            ...this.realtimeCache[vin],
-            ...respondData,
-            _mqttTimestamp: Date.now(),
-        };
+        // Check if there's a pending waiter for this data (trigger+wait pattern)
+        const requestSerial = respondData.requestSerial || payload.data?.requestSerial;
+        if (requestSerial && this.pendingMqttWaiters.has(requestSerial)) {
+            const waiter = this.pendingMqttWaiters.get(requestSerial);
+            if (waiter.type === 'vehicleInfo' && waiter.vin === vin) {
+                this.log.debug(`MQTT vehicleInfo resolved waiter for ${vin} (serial: ${requestSerial})`);
+                waiter.resolve(respondData);
+                return; // Waiter will handle the data processing
+            }
+        }
 
-        // Parse into status channel
-        this.json2iob.parse(`${vin}.status`, respondData, {
-            forceIndex: true,
-            descriptions,
-            states,
-        });
+        // No waiter - process directly (push notification from car)
+        this.processRealtimeData(vin, respondData);
     }
 
     /**
@@ -913,11 +1329,20 @@ class Byd extends utils.Adapter {
             this.log.debug(
                 `MQTT GPS response for ${vin}: lat=${respondData.data.latitude}, lon=${respondData.data.longitude}`,
             );
-            this.json2iob.parse(`${vin}.status.gps`, respondData.data, {
-                forceIndex: true,
-                descriptions,
-                states,
-            });
+
+            // Check if there's a pending GPS waiter
+            const requestSerial = respondData.requestSerial || payload.data?.requestSerial;
+            if (requestSerial && this.pendingMqttWaiters.has(requestSerial)) {
+                const waiter = this.pendingMqttWaiters.get(requestSerial);
+                if (waiter.type === 'gps' && waiter.vin === vin) {
+                    this.log.debug(`MQTT GPS resolved waiter for ${vin} (serial: ${requestSerial})`);
+                    waiter.resolve(respondData);
+                    return;
+                }
+            }
+
+            // No waiter - process directly
+            this.processGpsData(vin, respondData);
             return;
         }
 
@@ -1017,7 +1442,7 @@ class Byd extends utils.Adapter {
                     this.log.debug(`MQTT timeout for ${commandType} (${requestSerial}), falling back to HTTP`);
                     resolve(null);
                 }
-            }, this.mqttCommandTimeout);
+            }, this.mqttWaitTimeout);
 
             this.pendingRemoteControls.set(requestSerial, {
                 resolve: result => {
@@ -1321,7 +1746,7 @@ class Byd extends utils.Adapter {
         }
 
         // Step 2: Wait for MQTT result (MQTT-first pattern)
-        this.log.debug(`Waiting for MQTT result (${this.mqttCommandTimeout}ms timeout)...`);
+        this.log.debug(`Waiting for MQTT result (${this.mqttWaitTimeout}ms timeout)...`);
         const mqttResult = await this.waitForMqttResult(requestSerial, vin, commandType);
 
         if (mqttResult) {
@@ -1589,7 +2014,8 @@ class Byd extends utils.Adapter {
     onUnload(callback) {
         try {
             this.setState('info.connection', false, true);
-            this.updateInterval && clearInterval(this.updateInterval);
+            this.telemetryInterval && clearInterval(this.telemetryInterval);
+            this.gpsInterval && clearInterval(this.gpsInterval);
             this.refreshTimeout && clearTimeout(this.refreshTimeout);
             if (this.mqttClient) {
                 this.mqttClient.end(true);
