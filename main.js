@@ -1357,7 +1357,7 @@ class Byd extends utils.Adapter {
             );
 
             // Check if there's a pending GPS waiter
-            const requestSerial = respondData.requestSerial || payload.data?.requestSerial;
+            const requestSerial = respondData.requestSerial || payload.data?.uuid;
             if (requestSerial && this.pendingMqttWaiters.has(requestSerial)) {
                 const waiter = this.pendingMqttWaiters.get(requestSerial);
                 if (waiter.type === 'gps' && waiter.vin === vin) {
