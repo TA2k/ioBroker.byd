@@ -224,6 +224,13 @@ class Byd extends utils.Adapter {
                     this.processRealtimeData(vin, data);
                     return;
                 }
+            } else if (bydapi.isSessionExpired(decoded.code)) {
+                this.log.warn(`Session expired during realtime trigger for ${vin} (code=${decoded.code})`);
+                await this.handleSessionExpired(decoded.code, 'realtimeTrigger');
+                return;
+            } else if (decoded.code !== '0') {
+                this.log.warn(`Realtime trigger failed for ${vin}: code=${decoded.code}, message=${decoded.message || 'unknown'}`);
+                return;
             }
         } catch (error) {
             this.log.error(`Realtime trigger error for ${vin}: ${error.message}`);
