@@ -440,6 +440,15 @@ class Byd extends utils.Adapter {
                     this.processGpsData(vin, data);
                     return;
                 }
+            } else if (bydapi.isSessionExpired(decoded.code)) {
+                this.log.warn(`Session expired during GPS trigger for ${vin} (code=${decoded.code})`);
+                await this.handleSessionExpired(decoded.code, 'gpsTrigger');
+                return;
+            } else if (decoded.code !== '0') {
+                this.log.warn(
+                    `GPS trigger failed for ${vin}: code=${decoded.code}, message=${decoded.message || 'unknown'}`,
+                );
+                return;
             }
         } catch (error) {
             this.log.error(`GPS trigger error for ${vin}: ${error.message}`);
