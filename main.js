@@ -164,6 +164,7 @@ class Byd extends utils.Adapter {
      * Poll realtime data for all vehicles using trigger + MQTT wait + HTTP fallback
      */
     async pollAllVehiclesRealtime() {
+        this.log.debug(`Scheduled poll: realtime for ${this.vehicleArray.length} vehicle(s)`);
         for (const vehicle of this.vehicleArray) {
             await this.pollVehicleRealtimeWithMqtt(vehicle.vin);
         }
@@ -173,6 +174,7 @@ class Byd extends utils.Adapter {
      * Poll GPS data for all vehicles
      */
     async pollAllVehiclesGps() {
+        this.log.debug(`Scheduled poll: GPS for ${this.vehicleArray.length} vehicle(s)`);
         for (const vehicle of this.vehicleArray) {
             await this.pollGpsWithMqtt(vehicle.vin);
         }
@@ -354,6 +356,7 @@ class Byd extends utils.Adapter {
         }
 
         // Parse into ioBroker states
+        this.log.debug(`Writing realtime data to ${vin}.status (soc=${data.elecPercent}, mileage=${data.totalMileage})`);
         this.json2iob.parse(`${vin}.status`, data, {
             forceIndex: true,
             descriptions,
@@ -558,6 +561,7 @@ class Byd extends utils.Adapter {
     processGpsData(vin, data) {
         // GPS response can have nested data structure
         const gpsData = data.data || data;
+        this.log.debug(`Writing GPS data to ${vin}.status.gps (lat=${gpsData.latitude}, lon=${gpsData.longitude})`);
         this.json2iob.parse(`${vin}.status.gps`, gpsData, {
             forceIndex: true,
             channelName: 'GPS Location',
