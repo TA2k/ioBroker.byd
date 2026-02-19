@@ -356,7 +356,9 @@ class Byd extends utils.Adapter {
         }
 
         // Parse into ioBroker states
-        this.log.debug(`Writing realtime data to ${vin}.status (soc=${data.elecPercent}, mileage=${data.totalMileage})`);
+        this.log.debug(
+            `Writing realtime data to ${vin}.status (soc=${data.elecPercent}, mileage=${data.totalMileage})`,
+        );
         this.json2iob.parse(`${vin}.status`, data, {
             forceIndex: true,
             descriptions,
