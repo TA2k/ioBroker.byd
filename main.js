@@ -229,7 +229,9 @@ class Byd extends utils.Adapter {
                 await this.handleSessionExpired(decoded.code, 'realtimeTrigger');
                 return;
             } else if (decoded.code !== '0') {
-                this.log.warn(`Realtime trigger failed for ${vin}: code=${decoded.code}, message=${decoded.message || 'unknown'}`);
+                this.log.warn(
+                    `Realtime trigger failed for ${vin}: code=${decoded.code}, message=${decoded.message || 'unknown'}`,
+                );
                 return;
             }
         } catch (error) {
