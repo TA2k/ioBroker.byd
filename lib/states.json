@@ -10,9 +10,9 @@
     "1": "Connected"
   },
   "vehicleState": {
-    "0": "Standby",
-    "1": "Active",
-    "2": "Unknown"
+    "0": "On",
+    "1": "Unknown",
+    "2": "Off"
   },
   "powerGear": {
     "0": "Unknown",
