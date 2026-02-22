@@ -171,7 +171,7 @@ class Byd extends utils.Adapter {
         for (const vehicle of this.vehicleArray) {
             await this.pollVehicleRealtimeWithMqtt(vehicle.vin);
             // TEMPORARY: Run SOC comparison after each realtime poll
-            await this.compareChargingSocWithRealtime(vehicle.vin);
+            // await this.compareChargingSocWithRealtime(vehicle.vin);
         }
     }
 
@@ -1154,7 +1154,7 @@ class Byd extends utils.Adapter {
         await this.fetchHvacStatus(vin);
 
         // TEMPORARY: Compare Charging soc vs Realtime elecPercent
-        await this.compareChargingSocWithRealtime(vin);
+        // await this.compareChargingSocWithRealtime(vin);
     }
 
     /**
