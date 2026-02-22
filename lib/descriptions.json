@@ -215,7 +215,7 @@
     "batteryHeat": "Battery heat (0=off, 1=on)",
     "rate": "Charging rate",
     "lessOneMin": "Less than one minute to full",
-    "gl": "Unknown field",
+    "gl": "Power flow in W (negative=consuming, positive=charging)",
     "ins": "Unknown field",
     "type": "Data type identifier",
     "totalConsumptionEn": "Total consumption English text",
