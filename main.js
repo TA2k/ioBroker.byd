@@ -1191,16 +1191,21 @@ class Byd extends utils.Adapter {
                 const chargingSoc = data.soc;
                 const realtime = this.realtimeCache[vin] || {};
 
+                // State code mappings for logging
+                const chargingStateMap = { '-1': 'Disconnected', '0': 'Not Charging', '1': 'Charging', '15': 'Gun Connected' };
+                const connectStateMap = { '-1': 'Unknown', '0': 'Disconnected', '1': 'Connected' };
+                const chargeStateMap = { '-1': 'Unknown', '0': 'Not Charging', '1': 'Charging', '2': 'Charged' };
+
                 this.log.info(`=== SOC COMPARISON for ${vin} ===`);
                 this.log.info(`  Charging soc:          ${chargingSoc}`);
                 this.log.info(`  Realtime elecPercent:  ${realtime.elecPercent}`);
                 this.log.info(`  Difference:            ${chargingSoc - realtime.elecPercent}`);
                 this.log.info(`--- STATE FIELDS ---`);
-                this.log.info(`  Charging chargingState:  ${data.chargingState}`);
-                this.log.info(`  Realtime chargingState:  ${realtime.chargingState}`);
-                this.log.info(`  Charging connectState:   ${data.connectState}`);
-                this.log.info(`  Realtime connectState:   ${realtime.connectState}`);
-                this.log.info(`  Realtime chargeState:    ${realtime.chargeState}`);
+                this.log.info(`  Charging chargingState:  ${data.chargingState} (${chargingStateMap[data.chargingState] || '?'})`);
+                this.log.info(`  Realtime chargingState:  ${realtime.chargingState} (${chargingStateMap[realtime.chargingState] || '?'})`);
+                this.log.info(`  Charging connectState:   ${data.connectState} (${connectStateMap[data.connectState] || '?'})`);
+                this.log.info(`  Realtime connectState:   ${realtime.connectState} (${connectStateMap[realtime.connectState] || '?'})`);
+                this.log.info(`  Realtime chargeState:    ${realtime.chargeState} (${chargeStateMap[realtime.chargeState] || '?'})`);
                 this.log.info(`--- TIME TO FULL ---`);
                 this.log.info(`  Charging fullHour/Min:   ${data.fullHour}h ${data.fullMinute}m`);
                 this.log.info(`  Realtime remaining:      ${realtime.remainingHours}h ${realtime.remainingMinutes}m`);
