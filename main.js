@@ -170,6 +170,8 @@ class Byd extends utils.Adapter {
         this.log.debug(`Scheduled poll: realtime for ${this.vehicleArray.length} vehicle(s)`);
         for (const vehicle of this.vehicleArray) {
             await this.pollVehicleRealtimeWithMqtt(vehicle.vin);
+            // TEMPORARY: Run SOC comparison after each realtime poll
+            await this.compareChargingSocWithRealtime(vehicle.vin);
         }
     }
 
