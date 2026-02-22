@@ -31,8 +31,12 @@
     "3": "High"
   },
   "chargingState": {
-    "-1": "Disconnected",
+    "-1": "Unknown",
     "0": "Not Charging",
+    "1": "Charging"
+  },
+  "chargeState": {
+    "0": "Not Connected",
     "1": "Charging",
     "15": "Gun Connected"
   },
