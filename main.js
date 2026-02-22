@@ -70,9 +70,6 @@ class Byd extends utils.Adapter {
 
         this.subscribeStates('*');
 
-        // Clean up old subfolder structure from previous versions
-        await this.cleanupOldStateStructure();
-
         await this.login();
 
         if (!this.session) {
@@ -80,6 +77,9 @@ class Byd extends utils.Adapter {
         }
 
         await this.getVehicleList();
+
+        // Clean up old subfolder structure from previous versions
+        await this.cleanupOldStateStructure();
 
         // Verify control PIN at startup if configured
         if (this.config.controlPin && this.vehicleArray.length > 0) {
@@ -587,31 +587,15 @@ class Byd extends utils.Adapter {
     async cleanupOldStateStructure() {
         const oldSubfolders = ['charging', 'gps', 'hvac', 'energy', 'mqtt'];
 
-        // Get all devices (VINs)
-        const devices = await this.getDevicesAsync();
-        for (const device of devices) {
-            const vin = device._id.split('.').pop();
-            if (!vin || vin === 'info') {
-                continue;
-            }
-
+        for (const vehicle of this.vehicleArray) {
+            const vin = vehicle.vin;
             for (const subfolder of oldSubfolders) {
-                const channelId = `${this.namespace}.${vin}.status.${subfolder}`;
+                const objectId = `${vin}.status.${subfolder}`;
                 try {
-                    // Check if channel exists
-                    const obj = await this.getObjectAsync(`${vin}.status.${subfolder}`);
-                    if (obj) {
-                        this.log.info(`Cleaning up old subfolder: ${channelId}`);
-                        // Delete all states in this channel
-                        const states = await this.getStatesOfAsync(vin, `status.${subfolder}`);
-                        for (const state of states) {
-                            await this.delObjectAsync(state._id);
-                        }
-                        // Delete the channel itself
-                        await this.delObjectAsync(`${vin}.status.${subfolder}`);
-                    }
+                    await this.delObjectAsync(objectId, { recursive: true });
+                    this.log.info(`Deleted old subfolder: ${objectId}`);
                 } catch {
-                    // Channel doesn't exist, nothing to clean up
+                    // Object doesn't exist, ignore
                 }
             }
         }
