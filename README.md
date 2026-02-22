@@ -15,6 +15,35 @@
 
 iobroker Adapter for BYD cars based on https://github.com/Niek/BYD-re
 
+## Charging and Connection States
+
+The adapter reads vehicle status from the BYD Realtime API. Not all state fields work reliably across all vehicle models.
+
+### Working States (from Realtime API)
+
+| Field         | Value | Meaning                                  |
+|---------------|-------|------------------------------------------|
+| `chargeState` | 0     | Not connected                            |
+| `chargeState` | 1     | Charging                                 |
+| `chargeState` | 15    | Gun connected (plugged in, not charging) |
+
+### Unreliable States
+
+The following fields from the Realtime API return `-1` (Unknown) on some vehicle models and should not be relied upon:
+
+| Field          | Issue                              |
+|----------------|------------------------------------|
+| `chargingState` | Always returns -1 on some models  |
+| `connectState`  | Always returns -1 on some models  |
+
+**Note:** Home Assistant's BYD integration uses `chargingState` for charging detection, which does not work for all vehicles. This adapter uses `chargeState` instead, which appears to be more reliable.
+
+### Derived States
+
+Based on `chargeState`, the adapter provides:
+- **isCharging**: `chargeState === 1`
+- **isPluggedIn**: `chargeState === 1 || chargeState === 15`
+
 ## Changelog
 
 <!--

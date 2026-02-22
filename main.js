@@ -404,8 +404,8 @@ class Byd extends utils.Adapter {
         if (data.vehicleState === 1) {
             return true;
         }
-        // chargeState: 1 = charging (confirmed)
-        if (data.chargeState === 1) {
+        // chargeState: 0 = not connected, 1 = charging, 15 = gun connected (plugged in, not charging)
+        if (data.chargeState === 1 || data.chargeState === 15) {
             return true;
         }
         return false;
