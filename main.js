@@ -1177,7 +1177,7 @@ class Byd extends utils.Adapter {
         try {
             const res = await this.requestClient({
                 method: 'post',
-                url: `${bydapi.BASE_URL}/control/getChargeNow`,
+                url: `${bydapi.BASE_URL}/control/smartCharge/homePage`,
                 headers: {
                     'User-Agent': bydapi.USER_AGENT,
                     'Content-Type': 'application/json; charset=UTF-8',
