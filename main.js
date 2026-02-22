@@ -1208,19 +1208,19 @@ class Byd extends utils.Adapter {
                 const rtChargeLabel = chargeStateMap[realtime.chargeState] || '?';
 
                 this.log.info(`=== SOC COMPARISON for ${vin} ===`);
-                this.log.info(`--- REALTIME ---`);
-                this.log.info(`  elecPercent:     ${realtime.elecPercent}`);
-                this.log.info(`  chargeState:     ${realtime.chargeState} (${rtChargeLabel})`);
-                this.log.info(`  chargingState:   ${realtime.chargingState} (${rtChargingLabel})`);
-                this.log.info(`  connectState:    ${realtime.connectState} (${rtConnectLabel})`);
-                this.log.info(`  remainingTime:   ${realtime.remainingHours}h ${realtime.remainingMinutes}m`);
-                this.log.info(`--- CHARGING ENDPOINT ---`);
-                this.log.info(`  soc:             ${chargingSoc}`);
-                this.log.info(`  chargingState:   ${data.chargingState} (${chargingLabel})`);
-                this.log.info(`  connectState:    ${data.connectState} (${connectLabel})`);
-                this.log.info(`  fullHour/Min:    ${data.fullHour}h ${data.fullMinute}m`);
-                this.log.info(`--- DIFF ---`);
-                this.log.info(`  SOC diff:        ${chargingSoc - realtime.elecPercent}`);
+                this.log.info(`Realtime elecPercent:    ${realtime.elecPercent}`);
+                this.log.info(`Charging soc:            ${chargingSoc}`);
+                this.log.info(`SOC Difference:          ${chargingSoc - realtime.elecPercent}`);
+                this.log.info(`---`);
+                this.log.info(`Realtime chargeState:    ${realtime.chargeState} (${rtChargeLabel})`);
+                this.log.info(`Charging chargingState:  ${data.chargingState} (${chargingLabel})`);
+                this.log.info(`---`);
+                this.log.info(`Realtime chargingState:  ${realtime.chargingState} (${rtChargingLabel})`);
+                this.log.info(`Realtime connectState:   ${realtime.connectState} (${rtConnectLabel})`);
+                this.log.info(`Charging connectState:   ${data.connectState} (${connectLabel})`);
+                this.log.info(`---`);
+                this.log.info(`Realtime remaining:      ${realtime.remainingHours}h ${realtime.remainingMinutes}m`);
+                this.log.info(`Charging fullHour/Min:   ${data.fullHour}h ${data.fullMinute}m`);
                 this.log.info(`================================`);
             } else if (bydapi.isEndpointNotSupported(decoded.code)) {
                 this.log.info(`Charging endpoint not supported for ${vin}`);
