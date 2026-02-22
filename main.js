@@ -1192,20 +1192,31 @@ class Byd extends utils.Adapter {
                 const realtime = this.realtimeCache[vin] || {};
 
                 // State code mappings for logging
-                const chargingStateMap = { '-1': 'Disconnected', '0': 'Not Charging', '1': 'Charging', '15': 'Gun Connected' };
-                const connectStateMap = { '-1': 'Unknown', '0': 'Disconnected', '1': 'Connected' };
-                const chargeStateMap = { '-1': 'Unknown', '0': 'Not Charging', '1': 'Charging', '2': 'Charged' };
+                const chargingStateMap = {
+                    '-1': 'Disconnected',
+                    0: 'Not Charging',
+                    1: 'Charging',
+                    15: 'Gun Connected',
+                };
+                const connectStateMap = { '-1': 'Unknown', 0: 'Disconnected', 1: 'Connected' };
+                const chargeStateMap = { '-1': 'Unknown', 0: 'Not Charging', 1: 'Charging', 2: 'Charged' };
+
+                const chargingLabel = chargingStateMap[data.chargingState] || '?';
+                const rtChargingLabel = chargingStateMap[realtime.chargingState] || '?';
+                const connectLabel = connectStateMap[data.connectState] || '?';
+                const rtConnectLabel = connectStateMap[realtime.connectState] || '?';
+                const rtChargeLabel = chargeStateMap[realtime.chargeState] || '?';
 
                 this.log.info(`=== SOC COMPARISON for ${vin} ===`);
                 this.log.info(`  Charging soc:          ${chargingSoc}`);
                 this.log.info(`  Realtime elecPercent:  ${realtime.elecPercent}`);
                 this.log.info(`  Difference:            ${chargingSoc - realtime.elecPercent}`);
                 this.log.info(`--- STATE FIELDS ---`);
-                this.log.info(`  Charging chargingState:  ${data.chargingState} (${chargingStateMap[data.chargingState] || '?'})`);
-                this.log.info(`  Realtime chargingState:  ${realtime.chargingState} (${chargingStateMap[realtime.chargingState] || '?'})`);
-                this.log.info(`  Charging connectState:   ${data.connectState} (${connectStateMap[data.connectState] || '?'})`);
-                this.log.info(`  Realtime connectState:   ${realtime.connectState} (${connectStateMap[realtime.connectState] || '?'})`);
-                this.log.info(`  Realtime chargeState:    ${realtime.chargeState} (${chargeStateMap[realtime.chargeState] || '?'})`);
+                this.log.info(`  Charging chargingState:  ${data.chargingState} (${chargingLabel})`);
+                this.log.info(`  Realtime chargingState:  ${realtime.chargingState} (${rtChargingLabel})`);
+                this.log.info(`  Charging connectState:   ${data.connectState} (${connectLabel})`);
+                this.log.info(`  Realtime connectState:   ${realtime.connectState} (${rtConnectLabel})`);
+                this.log.info(`  Realtime chargeState:    ${realtime.chargeState} (${rtChargeLabel})`);
                 this.log.info(`--- TIME TO FULL ---`);
                 this.log.info(`  Charging fullHour/Min:   ${data.fullHour}h ${data.fullMinute}m`);
                 this.log.info(`  Realtime remaining:      ${realtime.remainingHours}h ${realtime.remainingMinutes}m`);
