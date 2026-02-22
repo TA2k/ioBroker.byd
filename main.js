@@ -392,7 +392,7 @@ class Byd extends utils.Adapter {
      * @param {object} data - Realtime data from API response
      */
     isVehicleOn(data) {
-        // Vehicle is considered "on" if engine is running or speed > 0
+        // Vehicle is considered "on" if engine is running, speed > 0, or charging
         if (data.engineStatus === 1) {
             return true;
         }
@@ -400,6 +400,10 @@ class Byd extends utils.Adapter {
             return true;
         }
         if (data.vehicleState === 1) {
+            return true;
+        }
+        // chargeState: 1 = charging (confirmed)
+        if (data.chargeState === 1) {
             return true;
         }
         return false;
@@ -1264,7 +1268,7 @@ class Byd extends utils.Adapter {
     handleMqttMessage(topic, message) {
         try {
             const messageStr = message.toString();
-            this.log.debug(`MQTT message on ${topic}: ${messageStr}`);
+            this.log.silly(`MQTT message on ${topic}: ${messageStr}`);
 
             // pyBYD approach: strip whitespace first, then always try to decrypt
             // MQTT messages are hex-encoded AES-encrypted payloads
