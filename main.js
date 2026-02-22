@@ -1150,6 +1150,61 @@ class Byd extends utils.Adapter {
         }
 
         await this.fetchHvacStatus(vin);
+
+        // TEMPORARY: Compare Charging soc vs Realtime elecPercent
+        await this.compareChargingSocWithRealtime(vin);
+    }
+
+    /**
+     * TEMPORARY: Fetch Charging endpoint and compare soc with elecPercent from Realtime
+     * Remove after testing!
+     *
+     * @param {string} vin - Vehicle VIN
+     */
+    async compareChargingSocWithRealtime(vin) {
+        if (!this.session) {
+            return;
+        }
+
+        const req = bydapi.buildChargingStatusRequest(
+            this.session,
+            this.config.countryCode,
+            this.config.language,
+            this.deviceConfig,
+            vin,
+        );
+
+        try {
+            const res = await this.requestClient({
+                method: 'post',
+                url: `${bydapi.BASE_URL}/control/getChargeNow`,
+                headers: {
+                    'User-Agent': bydapi.USER_AGENT,
+                    'Content-Type': 'application/json; charset=UTF-8',
+                },
+                data: { request: bydapi.encodeEnvelope(req.outer) },
+            });
+
+            const decoded = bydapi.decodeEnvelope(res.data);
+            if (decoded.code === '0' && decoded.respondData) {
+                const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
+                const chargingSoc = data.soc;
+                const realtimeElecPercent = this.realtimeCache[vin]?.elecPercent;
+
+                this.log.info(`=== SOC COMPARISON for ${vin} ===`);
+                this.log.info(`  Charging endpoint soc: ${chargingSoc}`);
+                this.log.info(`  Realtime elecPercent:  ${realtimeElecPercent}`);
+                this.log.info(`  Difference: ${chargingSoc - realtimeElecPercent}`);
+                this.log.info(`  Full Charging data: ${JSON.stringify(data)}`);
+                this.log.info(`================================`);
+            } else if (bydapi.isEndpointNotSupported(decoded.code)) {
+                this.log.info(`Charging endpoint not supported for ${vin}`);
+            } else {
+                this.log.warn(`Charging comparison failed: code=${decoded.code}`);
+            }
+        } catch (error) {
+            this.log.error(`Charging comparison error: ${error.message}`);
+        }
     }
 
     async connectMqtt() {
