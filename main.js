@@ -70,6 +70,9 @@ class Byd extends utils.Adapter {
 
         this.subscribeStates('*');
 
+        // Clean up old subfolder structure from previous versions
+        await this.cleanupOldStateStructure();
+
         await this.login();
 
         if (!this.session) {
@@ -555,7 +558,7 @@ class Byd extends utils.Adapter {
     }
 
     /**
-     * Process GPS data - update states
+     * Process GPS data - update states (flat structure under status.*)
      *
      * @param {string} vin - Vehicle identification number
      * @param {object} data - GPS data from API response
@@ -563,13 +566,51 @@ class Byd extends utils.Adapter {
     processGpsData(vin, data) {
         // GPS response can have nested data structure
         const gpsData = data.data || data;
-        this.log.debug(`Writing GPS data to ${vin}.status.gps (lat=${gpsData.latitude}, lon=${gpsData.longitude})`);
-        this.json2iob.parse(`${vin}.status.gps`, gpsData, {
+        this.log.debug(`Writing GPS data to ${vin}.status (lat=${gpsData.latitude}, lon=${gpsData.longitude})`);
+        // Flatten GPS data directly into status (no subfolder)
+        this.json2iob.parse(`${vin}.status`, gpsData, {
             forceIndex: true,
-            channelName: 'GPS Location',
             descriptions,
             states,
         });
+    }
+
+    /**
+     * Clean up old subfolder structure from previous versions.
+     * Deletes: status.charging, status.gps, status.hvac, status.energy, status.mqtt
+     * All data now goes directly into status.*
+     */
+    async cleanupOldStateStructure() {
+        const oldSubfolders = ['charging', 'gps', 'hvac', 'energy', 'mqtt'];
+
+        // Get all devices (VINs)
+        const devices = await this.getDevicesAsync();
+        for (const device of devices) {
+            const vin = device._id.split('.').pop();
+            if (!vin || vin === 'info') {
+                continue;
+            }
+
+            for (const subfolder of oldSubfolders) {
+                const channelId = `${this.namespace}.${vin}.status.${subfolder}`;
+                try {
+                    // Check if channel exists
+                    const obj = await this.getObjectAsync(`${vin}.status.${subfolder}`);
+                    if (obj) {
+                        this.log.info(`Cleaning up old subfolder: ${channelId}`);
+                        // Delete all states in this channel
+                        const states = await this.getStatesOfAsync(vin, `status.${subfolder}`);
+                        for (const state of states) {
+                            await this.delObjectAsync(state._id);
+                        }
+                        // Delete the channel itself
+                        await this.delObjectAsync(`${vin}.status.${subfolder}`);
+                    }
+                } catch {
+                    // Channel doesn't exist, nothing to clean up
+                }
+            }
+        }
     }
 
     async loadOrGenerateDeviceConfig() {
@@ -1008,8 +1049,7 @@ class Byd extends utils.Adapter {
             pollUrl: '/control/getGpsInfoResult',
             builder: bydapi.buildGpsInfoRequest,
             isReady: bydapi.isGpsDataReady,
-            channel: 'gps',
-            channelName: 'GPS Location',
+            // No channel - flat structure directly in status
         });
     }
 
@@ -1045,36 +1085,22 @@ class Byd extends utils.Adapter {
     }
 
     /**
-     * Fetch a status endpoint and parse into ioBroker states
+     * Fetch HVAC status and parse into ioBroker states (flat structure)
+     * Unwraps statusNow to match Realtime structure
      *
      * @param {string} vin - Vehicle VIN
-     * @param {object} endpoint - Endpoint config { name, channel, url, builder, fallbackField }
      */
-    async fetchStatusEndpoint(vin, endpoint) {
+    async fetchHvacStatus(vin) {
         if (!this.session) {
             return;
         }
 
         // Skip if endpoint is known to be unsupported for this VIN
-        if (this.unsupportedEndpoints[vin]?.has(endpoint.name)) {
-            // Use fallback if available
-            if (endpoint.fallbackField) {
-                const cached = this.realtimeCache[vin];
-                if (cached && cached[endpoint.fallbackField]) {
-                    this.json2iob.parse(
-                        `${vin}.status.${endpoint.channel}`,
-                        {
-                            [endpoint.fallbackField]: cached[endpoint.fallbackField],
-                            _fallback: true,
-                        },
-                        { forceIndex: true, descriptions, states },
-                    );
-                }
-            }
+        if (this.unsupportedEndpoints[vin]?.has('hvac')) {
             return;
         }
 
-        const req = endpoint.builder(
+        const req = bydapi.buildHvacStatusRequest(
             this.session,
             this.config.countryCode,
             this.config.language,
@@ -1084,7 +1110,7 @@ class Byd extends utils.Adapter {
 
         await this.requestClient({
             method: 'post',
-            url: `${bydapi.BASE_URL}${endpoint.url}`,
+            url: `${bydapi.BASE_URL}/control/getStatusNow`,
             headers: {
                 'User-Agent': bydapi.USER_AGENT,
                 'Content-Type': 'application/json; charset=UTF-8',
@@ -1092,77 +1118,50 @@ class Byd extends utils.Adapter {
             data: { request: bydapi.encodeEnvelope(req.outer) },
         })
             .then(async res => {
-                // this.log.debug(`${endpoint.name} response: ${JSON.stringify(res.data)}`);
                 const decoded = bydapi.decodeEnvelope(res.data);
-                // this.log.debug(`Decoded ${endpoint.name}: ${JSON.stringify(decoded)}`);
                 if (decoded.code === '0' && decoded.respondData) {
                     const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
-                    this.log.debug(`${endpoint.name} data: ${JSON.stringify(data)}`);
-                    this.json2iob.parse(`${vin}.status.${endpoint.channel}`, data, {
+                    // Unwrap statusNow to match Realtime flat structure
+                    const hvacData = data.statusNow || data;
+                    this.log.debug(`HVAC data: ${JSON.stringify(hvacData)}`);
+                    // Flat structure - directly into status
+                    this.json2iob.parse(`${vin}.status`, hvacData, {
                         forceIndex: true,
-                        channelName: endpoint.channelName,
                         descriptions,
                         states,
                     });
                 } else if (bydapi.isSessionExpired(decoded.code)) {
-                    await this.handleSessionExpired(decoded.code, endpoint.name);
+                    await this.handleSessionExpired(decoded.code, 'hvac');
                 } else if (bydapi.isEndpointNotSupported(decoded.code)) {
-                    this.log.info(`${endpoint.name} endpoint not supported for ${vin}`);
+                    this.log.info(`HVAC endpoint not supported for ${vin}`);
                     if (!this.unsupportedEndpoints[vin]) {
                         this.unsupportedEndpoints[vin] = new Set();
                     }
-                    this.unsupportedEndpoints[vin].add(endpoint.name);
-
-                    // Use fallback if available
-                    if (endpoint.fallbackField) {
-                        const cached = this.realtimeCache[vin];
-                        if (cached && cached[endpoint.fallbackField]) {
-                            this.json2iob.parse(
-                                `${vin}.status.${endpoint.channel}`,
-                                {
-                                    [endpoint.fallbackField]: cached[endpoint.fallbackField],
-                                    _fallback: true,
-                                },
-                                { forceIndex: true, descriptions, states },
-                            );
-                        }
-                    }
+                    this.unsupportedEndpoints[vin].add('hvac');
                 }
             })
             .catch(error => {
-                this.log.error(`${endpoint.name} error: ${error.message}`);
+                this.log.error(`HVAC error: ${error.message}`);
             });
     }
 
+    /**
+     * Fetch HVAC status if vehicle is on (like Home Assistant).
+     * Energy and Charging endpoints removed - data already in Realtime.
+     *
+     * @param {string} vin - Vehicle VIN
+     */
     async getVehicleStatusEndpoints(vin) {
-        const endpoints = [
-            {
-                name: 'energy',
-                channel: 'energy',
-                channelName: 'Energy Consumption',
-                url: '/vehicleInfo/vehicle/getEnergyConsumption',
-                builder: bydapi.buildEnergyConsumptionRequest,
-                fallbackField: 'totalEnergy',
-            },
-            {
-                name: 'hvac',
-                channel: 'hvac',
-                channelName: 'Climate Control',
-                url: '/control/getStatusNow',
-                builder: bydapi.buildHvacStatusRequest,
-            },
-            {
-                name: 'charging',
-                channel: 'charging',
-                channelName: 'Charging Status',
-                url: '/control/smartCharge/homePage',
-                builder: bydapi.buildChargingStatusRequest,
-            },
-        ];
-
-        for (const endpoint of endpoints) {
-            await this.fetchStatusEndpoint(vin, endpoint);
+        // Only fetch HVAC when vehicle is on (like HA)
+        // HVAC provides additional fields not in Realtime:
+        // acSwitch, windMode, airConditioningMode, tempOutCar, defrost status, etc.
+        const isOn = this.vehicleOnState[vin];
+        if (!isOn) {
+            this.log.debug(`Skipping HVAC fetch for ${vin} - vehicle is off`);
+            return;
         }
+
+        await this.fetchHvacStatus(vin);
     }
 
     async connectMqtt() {
@@ -1453,21 +1452,14 @@ class Byd extends utils.Adapter {
             }
         }
 
-        // Store control result
-        this.json2iob.parse(`${vin}.status.mqtt.remoteControl`, respondData, {
-            forceIndex: true,
-            descriptions,
-            states,
-        });
-
-        // Update HVAC state if climate command completed successfully
+        // Update HVAC state if climate command completed successfully (flat structure)
         if (success && commandType) {
             const cmdUpper = String(commandType).toUpperCase();
             if (cmdUpper === 'CLOSEAIR') {
-                this.setStateAsync(`${vin}.status.hvac.status`, 0, true).catch(() => {});
-                this.setStateAsync(`${vin}.status.hvac.acSwitch`, 0, true).catch(() => {});
+                this.setStateAsync(`${vin}.status.status`, 0, true).catch(() => {});
+                this.setStateAsync(`${vin}.status.acSwitch`, 0, true).catch(() => {});
             } else if (cmdUpper === 'OPENAIR') {
-                this.setStateAsync(`${vin}.status.hvac.status`, 2, true).catch(() => {});
+                this.setStateAsync(`${vin}.status.status`, 2, true).catch(() => {});
             }
         }
     }
@@ -1888,9 +1880,9 @@ class Byd extends utils.Adapter {
 
         // Mapping: status path -> { remote, transform }
         // When status changes with ack=true, update corresponding remote state
-        // Note: realtime data is parsed directly into status (not status.realtime)
+        // Flat structure - all fields directly under status.*
         const statusToRemoteMap = {
-            'hvac.statusNow.status': { remote: 'climate', transform: v => v === 2 },
+            status: { remote: 'climate', transform: v => v === 2 }, // HVAC status field
             batteryHeatState: { remote: 'batteryHeat', transform: v => v > 0 },
             mainSeatHeatState: { remote: 'seatHeat', transform: v => v > 0 },
             leftFrontDoorLock: { remote: 'lock', transform: v => v === 2 },
