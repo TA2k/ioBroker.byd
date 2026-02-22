@@ -1189,13 +1189,21 @@ class Byd extends utils.Adapter {
             if (decoded.code === '0' && decoded.respondData) {
                 const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
                 const chargingSoc = data.soc;
-                const realtimeElecPercent = this.realtimeCache[vin]?.elecPercent;
+                const realtime = this.realtimeCache[vin] || {};
 
                 this.log.info(`=== SOC COMPARISON for ${vin} ===`);
-                this.log.info(`  Charging endpoint soc: ${chargingSoc}`);
-                this.log.info(`  Realtime elecPercent:  ${realtimeElecPercent}`);
-                this.log.info(`  Difference: ${chargingSoc - realtimeElecPercent}`);
-                this.log.info(`  Full Charging data: ${JSON.stringify(data)}`);
+                this.log.info(`  Charging soc:          ${chargingSoc}`);
+                this.log.info(`  Realtime elecPercent:  ${realtime.elecPercent}`);
+                this.log.info(`  Difference:            ${chargingSoc - realtime.elecPercent}`);
+                this.log.info(`--- STATE FIELDS ---`);
+                this.log.info(`  Charging chargingState:  ${data.chargingState}`);
+                this.log.info(`  Realtime chargingState:  ${realtime.chargingState}`);
+                this.log.info(`  Charging connectState:   ${data.connectState}`);
+                this.log.info(`  Realtime connectState:   ${realtime.connectState}`);
+                this.log.info(`  Realtime chargeState:    ${realtime.chargeState}`);
+                this.log.info(`--- TIME TO FULL ---`);
+                this.log.info(`  Charging fullHour/Min:   ${data.fullHour}h ${data.fullMinute}m`);
+                this.log.info(`  Realtime remaining:      ${realtime.remainingHours}h ${realtime.remainingMinutes}m`);
                 this.log.info(`================================`);
             } else if (bydapi.isEndpointNotSupported(decoded.code)) {
                 this.log.info(`Charging endpoint not supported for ${vin}`);
