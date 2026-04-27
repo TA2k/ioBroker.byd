@@ -33,8 +33,10 @@ class Byd extends utils.Adapter {
         this.unsupportedEndpoints = {}; // { vin: Set(['energy', 'hvac', 'charging']) }
         // Cache realtime data for fallback
         this.realtimeCache = {}; // { vin: {...} }
-        // Track vehicle on/off state for smart GPS polling
-        this.vehicleOnState = {}; // { vin: boolean }
+        // Track vehicle active state (driving/charging) for smart GPS polling
+        this.vehicleActiveState = {}; // { vin: boolean }
+        // Track vehicle online state (T-Box reachable) for sleep/wake protection
+        this.vehicleOnlineState = {}; // { vin: boolean }
         // MQTT client for push notifications
         this.mqttClient = null;
         this.mqttBroker = null;
@@ -145,7 +147,7 @@ class Byd extends utils.Adapter {
         let intervalSeconds;
         if (this.config.smartGpsPolling) {
             // Check if any vehicle is on
-            const anyVehicleOn = Object.values(this.vehicleOnState).some(v => v === true);
+            const anyVehicleOn = Object.values(this.vehicleActiveState).some(v => v === true);
             intervalSeconds = anyVehicleOn
                 ? Math.max(10, Math.min(300, this.config.gpsActiveInterval || 30))
                 : Math.max(60, Math.min(3600, this.config.gpsInactiveInterval || 600));
@@ -167,7 +169,10 @@ class Byd extends utils.Adapter {
      * Poll realtime data for all vehicles using trigger + MQTT wait + HTTP fallback
      */
     async pollAllVehiclesRealtime() {
-        this.log.debug(`Scheduled poll: realtime for ${this.vehicleArray.length} vehicle(s)`);
+        const onlineVins = this.vehicleArray
+            .map(v => `${v.vin}=${this.vehicleOnlineState[v.vin] === false ? 'sleeping' : 'online'}`)
+            .join(', ');
+        this.log.debug(`Scheduled poll: realtime for ${this.vehicleArray.length} vehicle(s) [${onlineVins}]`);
         for (const vehicle of this.vehicleArray) {
             await this.pollVehicleRealtimeWithMqtt(vehicle.vin);
             // TEMPORARY: Run SOC comparison after each realtime poll
@@ -198,7 +203,7 @@ class Byd extends utils.Adapter {
             return;
         }
 
-        // Step 1: Trigger request
+        // Step 1: Trigger request (cheap cloud call, does not wake T-Box)
         const triggerReq = bydapi.buildVehicleRealtimeRequest(
             this.session,
             this.config.countryCode,
@@ -228,6 +233,13 @@ class Byd extends utils.Adapter {
                 // If trigger response already has data, use it
                 if (bydapi.isRealtimeDataReady(data)) {
                     this.log.debug(`Realtime data ready from trigger for ${vin}`);
+                    this.processRealtimeData(vin, data);
+                    return;
+                }
+
+                // Vehicle offline: update state from trigger response, skip poll-loop
+                if (Number(data.onlineState) === 2) {
+                    this.log.info(`Vehicle ${vin} is sleeping (onlineState=2) - skipping MQTT wait and poll-loop`);
                     this.processRealtimeData(vin, data);
                     return;
                 }
@@ -349,14 +361,29 @@ class Byd extends utils.Adapter {
     processRealtimeData(vin, data) {
         this.realtimeCache[vin] = data;
 
-        // Update vehicle on/off state for smart GPS polling
-        const wasOn = this.vehicleOnState[vin];
-        const isOn = this.isVehicleOn(data);
-        this.vehicleOnState[vin] = isOn;
+        // Update vehicle online state (T-Box reachable) for sleep/wake protection
+        const wasOnline = this.vehicleOnlineState[vin];
+        const isOnline = Number(data.onlineState) !== 2;
+        this.vehicleOnlineState[vin] = isOnline;
+        this.log.debug(`Vehicle ${vin} onlineState=${data.onlineState} -> isOnline=${isOnline} (was=${wasOnline})`);
+        if (wasOnline === false && isOnline) {
+            this.log.info(`Vehicle ${vin} is back online`);
+        } else if (wasOnline !== false && !isOnline) {
+            this.log.info(`Vehicle ${vin} went offline (sleeping)`);
+        }
+
+        // Update vehicle active state for smart GPS polling
+        const wasActive = this.vehicleActiveState[vin];
+        const isActive = this.isVehicleActive(data);
+        this.vehicleActiveState[vin] = isActive;
+        this.log.debug(
+            `Vehicle ${vin} isActive=${isActive} (was=${wasActive})` +
+                ` [engine=${data.engineStatus}, speed=${data.speed}, vehicleState=${data.vehicleState}, chargeState=${data.chargeState}]`,
+        );
 
         // Re-schedule GPS if vehicle state changed and smart polling enabled
-        if (this.config.smartGpsPolling && wasOn !== isOn) {
-            this.log.debug(`Vehicle ${vin} state changed: ${wasOn} -> ${isOn}, rescheduling GPS`);
+        if (this.config.smartGpsPolling && wasActive !== isActive) {
+            this.log.debug(`Vehicle ${vin} active state changed: ${wasActive} -> ${isActive}, rescheduling GPS`);
             this.scheduleGpsPolling();
         }
 
@@ -389,12 +416,11 @@ class Byd extends utils.Adapter {
     }
 
     /**
-     * Check if vehicle is on based on realtime data
+     * Check if vehicle is active (driving, charging, or engine running)
      *
      * @param {object} data - Realtime data from API response
      */
-    isVehicleOn(data) {
-        // Vehicle is considered "on" if engine is running, speed > 0, or charging
+    isVehicleActive(data) {
         if (data.engineStatus === 1) {
             return true;
         }
@@ -418,6 +444,12 @@ class Byd extends utils.Adapter {
      */
     async pollGpsWithMqtt(vin) {
         if (!this.session) {
+            return;
+        }
+
+        // Skip trigger if vehicle is offline (sleep/wake protection)
+        if (this.vehicleOnlineState[vin] === false) {
+            this.log.info(`Skipping GPS trigger for ${vin} - vehicle is sleeping`);
             return;
         }
 
@@ -1142,12 +1174,12 @@ class Byd extends utils.Adapter {
      * @param {string} vin - Vehicle VIN
      */
     async getVehicleStatusEndpoints(vin) {
-        // Only fetch HVAC when vehicle is on (like HA)
+        // Only fetch HVAC when vehicle is active (like HA)
         // HVAC provides additional fields not in Realtime:
         // acSwitch, windMode, airConditioningMode, tempOutCar, defrost status, etc.
-        const isOn = this.vehicleOnState[vin];
-        if (!isOn) {
-            this.log.debug(`Skipping HVAC fetch for ${vin} - vehicle is off`);
+        const isActive = this.vehicleActiveState[vin];
+        if (!isActive) {
+            this.log.debug(`Skipping HVAC fetch for ${vin} - vehicle inactive`);
             return;
         }
 
