@@ -1,8 +1,12 @@
 {
     "common": {
         "name": "byd",
-        "version": "0.1.1",
+        "version": "0.1.2",
         "news": {
+            "0.1.2": {
+                "en": "Remove poll interval max cap, add option to disable GPS polling, add manual GPS refresh button",
+                "de": "Poll-Intervall Obergrenze entfernt, Option zum Deaktivieren des GPS-Pollings, manueller GPS-Refresh-Button"
+            },
             "0.1.1": {
                 "en": "initial release",
                 "de": "Erstveröffentlichung",
@@ -83,6 +87,7 @@
         "language": "en",
         "pollInterval": 300,
         "gpsPollInterval": 300,
+        "disableGpsPolling": false,
         "smartGpsPolling": false,
         "gpsActiveInterval": 30,
         "gpsInactiveInterval": 600

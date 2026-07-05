@@ -117,14 +117,18 @@ class Byd extends utils.Adapter {
      * Pattern: HTTP trigger -> wait for MQTT -> HTTP poll fallback
      */
     startPolling() {
-        const pollInterval = Math.max(30, Math.min(900, this.config.pollInterval || 300));
-        const gpsPollInterval = Math.max(30, Math.min(900, this.config.gpsPollInterval || 300));
+        const pollInterval = Math.max(30, this.config.pollInterval || 300);
 
-        this.log.info(`Telemetry poll interval: ${pollInterval}s, GPS poll interval: ${gpsPollInterval}s`);
-        if (this.config.smartGpsPolling) {
-            this.log.info(
-                `Smart GPS polling enabled: active=${this.config.gpsActiveInterval || 30}s, inactive=${this.config.gpsInactiveInterval || 600}s`,
-            );
+        if (this.config.disableGpsPolling) {
+            this.log.info(`Telemetry poll interval: ${pollInterval}s, GPS polling disabled`);
+        } else {
+            const gpsPollInterval = Math.max(30, this.config.gpsPollInterval || 300);
+            this.log.info(`Telemetry poll interval: ${pollInterval}s, GPS poll interval: ${gpsPollInterval}s`);
+            if (this.config.smartGpsPolling) {
+                this.log.info(
+                    `Smart GPS polling enabled: active=${this.config.gpsActiveInterval || 30}s, inactive=${this.config.gpsInactiveInterval || 600}s`,
+                );
+            }
         }
 
         // Telemetry polling
@@ -133,7 +137,9 @@ class Byd extends utils.Adapter {
         }, pollInterval * 1000);
 
         // GPS polling (with smart polling support)
-        this.scheduleGpsPolling();
+        if (!this.config.disableGpsPolling) {
+            this.scheduleGpsPolling();
+        }
     }
 
     /**
@@ -144,16 +150,20 @@ class Byd extends utils.Adapter {
             clearInterval(this.gpsInterval);
         }
 
+        if (this.config.disableGpsPolling) {
+            return;
+        }
+
         let intervalSeconds;
         if (this.config.smartGpsPolling) {
             // Check if any vehicle is on
             const anyVehicleOn = Object.values(this.vehicleActiveState).some(v => v === true);
             intervalSeconds = anyVehicleOn
-                ? Math.max(10, Math.min(300, this.config.gpsActiveInterval || 30))
-                : Math.max(60, Math.min(3600, this.config.gpsInactiveInterval || 600));
+                ? Math.max(10, this.config.gpsActiveInterval || 30)
+                : Math.max(60, this.config.gpsInactiveInterval || 600);
             this.log.debug(`Smart GPS polling: vehicleOn=${anyVehicleOn}, interval=${intervalSeconds}s`);
         } else {
-            intervalSeconds = Math.max(30, Math.min(900, this.config.gpsPollInterval || 300));
+            intervalSeconds = Math.max(30, this.config.gpsPollInterval || 300);
         }
 
         this.gpsInterval = setInterval(() => {
@@ -409,7 +419,8 @@ class Byd extends utils.Adapter {
             this.setStateAsync(`${vin}.remote.batteryHeat`, isOn, true);
         }
         if (data.mainSeatHeatState !== undefined) {
-            const isOn = data.mainSeatHeatState > 0;
+            // pyBYD: 0=no_data, 1=OFF, 2=LOW, 3=HIGH
+            const isOn = data.mainSeatHeatState >= 2;
             this.log.debug(`Status mainSeatHeatState=${data.mainSeatHeatState} -> remote.seatHeat=${isOn}`);
             this.setStateAsync(`${vin}.remote.seatHeat`, isOn, true);
         }
@@ -840,6 +851,7 @@ class Byd extends utils.Adapter {
 
                     const remoteArray = [
                         { command: 'refresh', name: 'Refresh Data' },
+                        { command: 'gpsRefresh', name: 'Refresh GPS Position' },
                         { command: 'lock', name: 'Door Lock true = locked, false = unlocked' },
                         { command: 'flash', name: 'Flash Lights' },
                         { command: 'findCar', name: 'Find Car (Flash + Horn)' },
@@ -2034,6 +2046,24 @@ class Byd extends utils.Adapter {
                 this.log.debug(`DEBUG refresh: calling updateSingleVehicle`);
                 await this.updateSingleVehicle(deviceId);
                 this.log.debug(`DEBUG refresh: updateSingleVehicle done`);
+                return;
+            }
+
+            if (command === 'gpsRefresh') {
+                // Ignore if value is not true (button press)
+                if (state.val !== true) {
+                    return;
+                }
+                this.log.info(`Manual GPS refresh requested for ${deviceId}`);
+                if (!this.session) {
+                    this.log.warn('No session - attempting re-login before GPS refresh');
+                    await this.login();
+                }
+                if (!this.session) {
+                    this.log.error('Still no session after re-login attempt');
+                    return;
+                }
+                await this.pollGpsWithMqtt(deviceId);
                 return;
             }
 
