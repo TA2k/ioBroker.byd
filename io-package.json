@@ -1,8 +1,12 @@
 {
     "common": {
         "name": "byd",
-        "version": "0.1.2",
+        "version": "0.2.0",
         "news": {
+            "0.2.0": {
+                "en": "Fix code=1001 on shared/guest accounts by sending signed userType on car-reaching endpoints (auto owner/guest detection); update to BYD app 3.6.0; configurable login identifier type; dedicated battery-heat endpoint; drop sensor placeholder values; MQTT recovery hardening",
+                "de": "Behebt code=1001 bei geteilten/Gast-Konten durch signiertes userType auf Fahrzeug-Endpunkten (automatische Owner/Gast-Erkennung); Update auf BYD-App 3.6.0; konfigurierbarer Login-Kennungstyp; eigener Endpunkt für Batterieheizung; Sensor-Platzhalterwerte verwerfen; robustere MQTT-Wiederherstellung"
+            },
             "0.1.2": {
                 "en": "Remove poll interval max cap, add option to disable GPS polling, add manual GPS refresh button",
                 "de": "Poll-Intervall Obergrenze entfernt, Option zum Deaktivieren des GPS-Pollings, manueller GPS-Refresh-Button"

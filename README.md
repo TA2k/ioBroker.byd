@@ -53,6 +53,17 @@ Based on `chargeState`, the adapter provides:
 
 ### **WORK IN PROGRESS**
 
+### 0.2.0 (2026-11-17)
+
+- (TA2k) Fix code=1001 on shared/guest accounts: send signed userType on car-reaching endpoints with automatic owner/guest detection and self-correction
+- (TA2k) Update device profile to BYD app 3.6.0; add configurable login identifier type (email/phone)
+- (TA2k) Battery heating now uses the dedicated /control/remoteControlBatteryHeat endpoint
+- (TA2k) Drop sensor placeholder/sentinel values and skip writing offline placeholder payloads so good data is not overwritten
+- (TA2k) MQTT: guard against foreign-session payloads and recover from CONNACK refusals with backoff
+- (TA2k) Redact tokens in debug logs
+
+### 0.1.2
+
 - (TA2k) initial release
 
 ## License
