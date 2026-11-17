@@ -101,9 +101,14 @@
     "1": "Open"
   },
   "sentryStatus": {
-    "0": "Off",
-    "1": "On",
-    "2": "Active"
+    "2": "On",
+    "4": "Off"
+  },
+  "steeringWheelHeatState": {
+    "-1": "On",
+    "0": "No Data",
+    "1": "Off",
+    "2": "On"
   },
   "batteryHeatState": {
     "0": "Off",

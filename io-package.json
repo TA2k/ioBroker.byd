@@ -85,6 +85,7 @@
         "controlPin": "",
         "countryCode": "DE",
         "language": "en",
+        "identifierType": "0",
         "pollInterval": 300,
         "gpsPollInterval": 300,
         "disableGpsPolling": false,

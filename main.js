@@ -11,6 +11,14 @@ const devicegen = require('./lib/devicegen');
 const descriptions = require('./lib/descriptions.json');
 const states = require('./lib/states.json');
 
+// MQTT recovery tuning (mirrors pyBYD client)
+const MQTT_DECRYPT_REAUTH_COOLDOWN_MS = 60000;
+const MQTT_DECRYPT_REAUTH_MAX = 1;
+const MQTT_CONNACK_REFUSAL_THRESHOLD = 3;
+const MQTT_RECOVERY_MAX_ATTEMPTS = 6;
+const MQTT_RECOVERY_BASE_DELAY_MS = 30000;
+const MQTT_RECOVERY_MAX_DELAY_MS = 1800000;
+
 class Byd extends utils.Adapter {
     constructor(options) {
         super({
@@ -28,11 +36,20 @@ class Byd extends utils.Adapter {
         this.gpsInterval = null;
         this.refreshTimeout = null;
         this.session = null;
+        // Dedup concurrent logins (MQTT recovery + HTTP session-expiry can race)
+        this.loginInFlight = null;
         this.deviceConfig = bydapi.DEFAULT_DEVICE_CONFIG;
         // Track unsupported endpoints per VIN to avoid repeated 1001 errors
         this.unsupportedEndpoints = {}; // { vin: Set(['energy', 'hvac', 'charging']) }
         // Cache realtime data for fallback
         this.realtimeCache = {}; // { vin: {...} }
+        // Per-VIN guest flag: true when the car was shared to this account ("Family
+        // and friends"). Guests must send a signed userType:"1" on car-reaching
+        // endpoints; owners must not. First guess from empowerType, self-corrected.
+        this.guestVins = {}; // { vin: boolean }
+        // Once a VIN's guest flag is flipped, lock it until a request succeeds, so a
+        // genuine (non-userType) 1001/8003 cannot oscillate the flag forever.
+        this.guestFlipLocked = {}; // { vin: boolean }
         // Track vehicle active state (driving/charging) for smart GPS polling
         this.vehicleActiveState = {}; // { vin: boolean }
         // Track vehicle online state (T-Box reachable) for sleep/wake protection
@@ -48,6 +65,15 @@ class Byd extends utils.Adapter {
         this.pendingRemoteControls = new Map();
         // MQTT wait timeout in ms (pyBYD uses 8 seconds for commands)
         this.mqttWaitTimeout = 8000;
+        // MQTT decrypt-key confirmation: once a payload decrypts, later decrypt
+        // failures are payloads for another session on the account, not a stale key
+        this.mqttKeyConfirmed = false;
+        this.mqttDecryptReauths = 0;
+        this.mqttDecryptReauthAt = 0;
+        // MQTT CONNACK-refusal recovery (re-login with backoff)
+        this.mqttConnackRefusals = 0;
+        this.mqttRecoveryAttempts = 0;
+        this.mqttRecoveryLastAt = 0;
 
         const jar = new CookieJar();
         this.requestClient = wrapper(
@@ -179,6 +205,17 @@ class Byd extends utils.Adapter {
      * Poll realtime data for all vehicles using trigger + MQTT wait + HTTP fallback
      */
     async pollAllVehiclesRealtime() {
+        // Recover a lost session (e.g. after a failed MQTT-recovery login) so polling
+        // does not stay dead until a manual restart.
+        if (!this.session) {
+            this.log.debug('No session at scheduled realtime poll - attempting re-login');
+            await this.login();
+            if (this.session) {
+                this.reconnectMqtt();
+            } else {
+                return;
+            }
+        }
         const onlineVins = this.vehicleArray
             .map(v => `${v.vin}=${this.vehicleOnlineState[v.vin] === false ? 'sleeping' : 'online'}`)
             .join(', ');
@@ -220,6 +257,8 @@ class Byd extends utils.Adapter {
             this.config.language,
             this.deviceConfig,
             vin,
+            null,
+            this.userTypeFor(vin),
         );
 
         let requestSerial = null;
@@ -256,6 +295,16 @@ class Byd extends utils.Adapter {
             } else if (bydapi.isSessionExpired(decoded.code)) {
                 this.log.warn(`Session expired during realtime trigger for ${vin} (code=${decoded.code})`);
                 await this.handleSessionExpired(decoded.code, 'realtimeTrigger');
+                return;
+            } else if (bydapi.isServiceBusy(decoded.code)) {
+                this.log.debug(
+                    `Realtime trigger for ${vin}: service busy (1008), retaining last data, retry next cycle`,
+                );
+                return;
+            } else if (bydapi.isVehicleUnreachable(decoded.code)) {
+                this.log.debug(`Realtime trigger for ${vin}: vehicle unreachable (6002), retaining last data`);
+                return;
+            } else if (this.flipGuestIfWrongUserType(vin, decoded.code, 'Realtime trigger')) {
                 return;
             } else if (decoded.code !== '0') {
                 this.log.warn(
@@ -333,6 +382,7 @@ class Byd extends utils.Adapter {
                 this.deviceConfig,
                 vin,
                 requestSerial,
+                this.userTypeFor(vin),
             );
 
             try {
@@ -363,14 +413,13 @@ class Byd extends utils.Adapter {
     }
 
     /**
-     * Process realtime data - update cache and states
+     * Update per-vehicle online/active flags from a realtime payload.
+     * Runs even for offline/placeholder payloads so sleep/wake tracking stays correct.
      *
      * @param {string} vin - Vehicle identification number
      * @param {object} data - Realtime data from API response
      */
-    processRealtimeData(vin, data) {
-        this.realtimeCache[vin] = data;
-
+    updateVehicleStateFlags(vin, data) {
         // Update vehicle online state (T-Box reachable) for sleep/wake protection
         const wasOnline = this.vehicleOnlineState[vin];
         const isOnline = Number(data.onlineState) !== 2;
@@ -386,16 +435,73 @@ class Byd extends utils.Adapter {
         const wasActive = this.vehicleActiveState[vin];
         const isActive = this.isVehicleActive(data);
         this.vehicleActiveState[vin] = isActive;
-        this.log.debug(
-            `Vehicle ${vin} isActive=${isActive} (was=${wasActive})` +
-                ` [engine=${data.engineStatus}, speed=${data.speed}, vehicleState=${data.vehicleState}, chargeState=${data.chargeState}]`,
-        );
 
         // Re-schedule GPS if vehicle state changed and smart polling enabled
         if (this.config.smartGpsPolling && wasActive !== isActive) {
             this.log.debug(`Vehicle ${vin} active state changed: ${wasActive} -> ${isActive}, rescheduling GPS`);
             this.scheduleGpsPolling();
         }
+    }
+
+    /**
+     * Carry previous good values forward when an incoming field is 0, so a
+     * placeholder/transient 0 does not overwrite valid telemetry.
+     *
+     * @param {object} data - Incoming realtime payload (mutated)
+     * @param {object} prev - Previous cached realtime payload
+     */
+    applyZeroDrop(data, prev) {
+        if (!prev) {
+            return;
+        }
+        // Only fields where 0 is physically impossible once a ready payload arrives:
+        // tyre pressure never reads 0 kPa on a parked car, and a car that has driven
+        // never reports total mileage 0. elecPercent/range are deliberately NOT here -
+        // 0 there can be a genuine reading (empty battery).
+        const zeroDropFields = [
+            'leftFrontTirepressure',
+            'rightFrontTirepressure',
+            'leftRearTirepressure',
+            'rightRearTirepressure',
+            'totalMileage',
+            'totalMileageV2',
+        ];
+        for (const field of zeroDropFields) {
+            if (
+                data[field] !== undefined &&
+                Number(data[field]) === 0 &&
+                prev[field] !== undefined &&
+                Number(prev[field]) !== 0
+            ) {
+                data[field] = prev[field];
+            }
+        }
+    }
+
+    /**
+     * Process realtime data - update cache and states
+     *
+     * @param {string} vin - Vehicle identification number
+     * @param {object} data - Realtime data from API response
+     */
+    processRealtimeData(vin, data) {
+        // A code=0 response proves the current userType guess is accepted - unlock flips
+        this.guestFlipLocked[vin] = false;
+        // Always track online/active flags, even for an offline placeholder payload
+        this.updateVehicleStateFlags(vin, data);
+
+        // Do not write an offline / not-ready placeholder: its all-zero payload
+        // would clobber the last good states.
+        if (Number(data.onlineState) === 2 || !bydapi.isRealtimeDataReady(data)) {
+            this.log.debug(`Skipping telemetry write for ${vin} (offline or data not ready)`);
+            return;
+        }
+
+        // Carry previous good values forward for transient zeros, then strip sentinels
+        this.applyZeroDrop(data, this.realtimeCache[vin]);
+        bydapi.sanitizeRealtime(data);
+
+        this.realtimeCache[vin] = data;
 
         // Parse into ioBroker states
         this.log.debug(
@@ -449,6 +555,46 @@ class Byd extends utils.Adapter {
     }
 
     /**
+     * Signed userType marker for a VIN: "1" for a guest (shared) car, null for an owner.
+     *
+     * @param {string} vin - Vehicle identification number
+     */
+    userTypeFor(vin) {
+        return this.guestVins[vin] ? bydapi.USER_TYPE_GUEST : null;
+    }
+
+    /**
+     * On a userType-mismatch error (1001 as owner-guess, 8003 as guest-guess), flip the
+     * per-VIN guest flag so the next request uses the other mode. Returns true if flipped.
+     *
+     * @param {string} vin - Vehicle identification number
+     * @param {string} code - API response code
+     * @param {string} context - Log context
+     */
+    flipGuestIfWrongUserType(vin, code, context) {
+        const assumedGuest = !!this.guestVins[vin];
+        if (!bydapi.isWrongUserType(code, assumedGuest)) {
+            return false;
+        }
+        if (this.guestFlipLocked[vin]) {
+            // Already tried both modes without success - this code is not a userType problem
+            this.log.warn(`${context}: code=${code} for ${vin} persists in both userType modes - not a userType issue`);
+            return false;
+        }
+        this.guestVins[vin] = !assumedGuest;
+        this.guestFlipLocked[vin] = true;
+        // A userType change can revive endpoints (e.g. HVAC) that were marked
+        // unsupported on an ambiguous 1001 while the guest flag was wrong.
+        if (this.unsupportedEndpoints[vin]) {
+            this.unsupportedEndpoints[vin].delete('hvac');
+        }
+        this.log.warn(
+            `${context}: userType mismatch (code=${code}) for ${vin} - switching to ${this.guestVins[vin] ? 'guest' : 'owner'} mode, retry next cycle`,
+        );
+        return true;
+    }
+
+    /**
      * Poll GPS with MQTT-first pattern
      *
      * @param {string} vin - Vehicle identification number
@@ -471,6 +617,8 @@ class Byd extends utils.Adapter {
             this.config.language,
             this.deviceConfig,
             vin,
+            null,
+            this.userTypeFor(vin),
         );
 
         let requestSerial = null;
@@ -500,6 +648,14 @@ class Byd extends utils.Adapter {
             } else if (bydapi.isSessionExpired(decoded.code)) {
                 this.log.warn(`Session expired during GPS trigger for ${vin} (code=${decoded.code})`);
                 await this.handleSessionExpired(decoded.code, 'gpsTrigger');
+                return;
+            } else if (bydapi.isServiceBusy(decoded.code)) {
+                this.log.debug(`GPS trigger for ${vin}: service busy (1008), retry next cycle`);
+                return;
+            } else if (bydapi.isVehicleUnreachable(decoded.code)) {
+                this.log.debug(`GPS trigger for ${vin}: vehicle unreachable (6002)`);
+                return;
+            } else if (this.flipGuestIfWrongUserType(vin, decoded.code, 'GPS trigger')) {
                 return;
             } else if (decoded.code !== '0') {
                 this.log.warn(
@@ -577,6 +733,7 @@ class Byd extends utils.Adapter {
                 this.deviceConfig,
                 vin,
                 requestSerial,
+                this.userTypeFor(vin),
             );
 
             try {
@@ -613,8 +770,17 @@ class Byd extends utils.Adapter {
      * @param {object} data - GPS data from API response
      */
     processGpsData(vin, data) {
+        // A code=0 response proves the current userType guess is accepted - unlock flips
+        this.guestFlipLocked[vin] = false;
         // GPS response can have nested data structure
         const gpsData = data.data || data;
+        // Drop a Null-Island (0,0) fix - it is a placeholder, not a real position
+        const lat = Number(gpsData.latitude ?? gpsData.latitudeDone);
+        const lon = Number(gpsData.longitude ?? gpsData.longitudeDone);
+        if (lat === 0 && lon === 0) {
+            this.log.debug(`Ignoring (0,0) GPS fix for ${vin}`);
+            return;
+        }
         this.log.debug(`Writing GPS data to ${vin}.status (lat=${gpsData.latitude}, lon=${gpsData.longitude})`);
         // Flatten GPS data directly into status (no subfolder)
         this.json2iob.parse(`${vin}.status`, gpsData, {
@@ -685,12 +851,24 @@ class Byd extends utils.Adapter {
     }
 
     async login() {
+        // Dedup: if a login is already running, await it instead of starting another
+        if (this.loginInFlight) {
+            return this.loginInFlight;
+        }
+        this.loginInFlight = this._doLogin().finally(() => {
+            this.loginInFlight = null;
+        });
+        return this.loginInFlight;
+    }
+
+    async _doLogin() {
         const { outer } = bydapi.buildLoginRequest(
             this.config.username,
             this.config.password,
             this.config.countryCode,
             this.config.language,
             this.deviceConfig,
+            this.config.identifierType || '0',
         );
 
         const envelope = bydapi.encodeEnvelope(outer);
@@ -707,7 +885,7 @@ class Byd extends utils.Adapter {
             .then(async res => {
                 // this.log.debug(`Login response: ${JSON.stringify(res.data)}`);
                 const decoded = bydapi.decodeEnvelope(res.data);
-                this.log.debug(`Decoded login: ${JSON.stringify(decoded)}`);
+                this.log.debug(`Decoded login: ${JSON.stringify(bydapi.redactForLog(decoded))}`);
 
                 if (decoded.code !== '0') {
                     this.log.error(`Login failed: code=${decoded.code} message=${decoded.message || ''}`);
@@ -771,7 +949,7 @@ class Byd extends utils.Adapter {
                 }
 
                 const data = bydapi.decryptResponseData(decoded.respondData, contentKey);
-                this.log.debug(`Vehicle list: ${JSON.stringify(data)}`);
+                this.log.debug(`Vehicle list: ${JSON.stringify(bydapi.redactForLog(data))}`);
 
                 // Sample: [{
                 //   "vin": "LGXXXXXXXXXXX00000", "autoAlias": "BYD SEALION 7", "autoPlate": "AB123CD",
@@ -797,6 +975,13 @@ class Byd extends utils.Adapter {
                     }
 
                     this.vehicleArray.push(vehicle);
+
+                    // empowerType < 0 means the car was shared to this account (guest).
+                    // Guests must send a signed userType on car-reaching endpoints.
+                    this.guestVins[vin] = Number(vehicle.empowerType) < 0;
+                    this.log.info(
+                        `Vehicle ${vin}: ${this.guestVins[vin] ? 'shared/guest account (userType=1)' : 'owner account'}`,
+                    );
 
                     // Device name: Model + Plate (e.g. "BYD SEALION 7 - KO591ET")
                     const modelName = vehicle.modelName || vehicle.autoAlias || 'BYD';
@@ -950,9 +1135,99 @@ class Byd extends utils.Adapter {
             this.mqttClient.end(true);
             this.mqttClient = null;
         }
+        // New credentials: decrypt key must be re-confirmed against a fresh payload.
+        // Do NOT reset mqttDecryptReauths here - that would defeat the attempt cap;
+        // it is reset only when a payload actually decrypts (handleMqttMessage).
+        this.mqttKeyConfirmed = false;
         if (this.session && this.vehicleArray?.length > 0) {
             this.connectMqtt();
         }
+    }
+
+    /**
+     * Handle an MQTT payload that failed to decrypt.
+     * Once the current key has decrypted at least one payload, a failure means the
+     * payload belongs to another session on the account - ignore it. Only an
+     * unconfirmed key triggers a real (rate-limited) re-login.
+     *
+     * @param {Error} decryptError - The decrypt/parse error
+     */
+    handleMqttDecryptFailure(decryptError) {
+        if (this.mqttKeyConfirmed) {
+            this.log.debug('MQTT payload not for this session (decrypt failed after key confirmed), ignoring');
+            return;
+        }
+        const now = Date.now();
+        if (
+            this.mqttDecryptReauths >= MQTT_DECRYPT_REAUTH_MAX ||
+            (this.mqttDecryptReauthAt && now - this.mqttDecryptReauthAt < MQTT_DECRYPT_REAUTH_COOLDOWN_MS)
+        ) {
+            this.log.debug(`MQTT decrypt failed (${decryptError.message}), re-auth suppressed (cooldown/cap)`);
+            return;
+        }
+        this.mqttDecryptReauths += 1;
+        this.mqttDecryptReauthAt = now;
+        this.log.warn(`MQTT decrypt failed (${decryptError.message}) with unconfirmed key - re-authenticating`);
+        // Tear down the client BEFORE nulling the session so its reconnect callback
+        // cannot dereference a null session mid re-login.
+        if (this.mqttClient) {
+            this.mqttClient.end(true);
+            this.mqttClient = null;
+        }
+        this.session = null;
+        this.setState('info.connection', false, true);
+        this.login().then(() => {
+            if (this.session) {
+                this.reconnectMqtt();
+            }
+        });
+    }
+
+    /**
+     * Recover from repeated MQTT CONNACK refusals by forcing a full re-login with
+     * exponential backoff. paho/mqtt.js otherwise reconnects forever with credentials
+     * the broker keeps rejecting (e.g. after a session takeover).
+     */
+    handleMqttConnackRefusal() {
+        this.mqttConnackRefusals += 1;
+        this.log.debug(`MQTT CONNACK refusal #${this.mqttConnackRefusals}`);
+        if (this.mqttConnackRefusals < MQTT_CONNACK_REFUSAL_THRESHOLD) {
+            return;
+        }
+        if (this.mqttRecoveryAttempts >= MQTT_RECOVERY_MAX_ATTEMPTS) {
+            this.log.error('MQTT recovery ceiling reached - stopping MQTT (will retry on next login)');
+            if (this.mqttClient) {
+                this.mqttClient.end(true);
+                this.mqttClient = null;
+            }
+            return;
+        }
+        const now = Date.now();
+        let delay = Math.min(
+            MQTT_RECOVERY_BASE_DELAY_MS * Math.pow(2, this.mqttRecoveryAttempts),
+            MQTT_RECOVERY_MAX_DELAY_MS,
+        );
+        delay *= 0.8 + Math.random() * 0.4; // jitter
+        // Truthy check: the very first recovery after boot must not be blocked by a cold clock
+        if (this.mqttRecoveryLastAt && now - this.mqttRecoveryLastAt < delay) {
+            this.log.debug('MQTT recovery still inside backoff window');
+            return;
+        }
+        this.mqttRecoveryAttempts += 1;
+        this.mqttRecoveryLastAt = now;
+        this.log.warn(
+            `MQTT CONNACK refused ${this.mqttConnackRefusals}x - forcing re-login (attempt ${this.mqttRecoveryAttempts})`,
+        );
+        if (this.mqttClient) {
+            this.mqttClient.end(true);
+            this.mqttClient = null;
+        }
+        this.session = null;
+        this.login().then(() => {
+            if (this.session) {
+                this.reconnectMqtt();
+            }
+        });
     }
 
     /**
@@ -973,6 +1248,8 @@ class Byd extends utils.Adapter {
             this.config.language,
             this.deviceConfig,
             vin,
+            null,
+            this.userTypeFor(vin),
         );
 
         let requestSerial = null;
@@ -1009,6 +1286,7 @@ class Byd extends utils.Adapter {
                 this.deviceConfig,
                 vin,
                 requestSerial,
+                this.userTypeFor(vin),
             );
 
             let ready = false;
@@ -1027,21 +1305,27 @@ class Byd extends utils.Adapter {
                     const decoded = bydapi.decodeEnvelope(res.data);
                     if (decoded.code === '0' && decoded.respondData) {
                         const data = bydapi.decryptResponseData(decoded.respondData, pollReq.contentKey);
-                        this.log.debug(`${endpoint.name} data: ${JSON.stringify(data)}`);
+                        this.log.debug(`${endpoint.name} data: ${JSON.stringify(bydapi.redactForLog(data))}`);
 
                         if (endpoint.isReady(data)) {
-                            if (endpoint.cache) {
-                                this.realtimeCache[vin] = data;
+                            if (endpoint.onData) {
+                                // Route through the same sanitizing/zero-drop/offline-skip
+                                // pipeline as the scheduled MQTT path.
+                                endpoint.onData(vin, data);
+                            } else {
+                                if (endpoint.cache) {
+                                    this.realtimeCache[vin] = data;
+                                }
+                                const parseOpts = { forceIndex: true, descriptions, states };
+                                if (endpoint.channelName) {
+                                    parseOpts.channelName = endpoint.channelName;
+                                }
+                                this.json2iob.parse(
+                                    `${vin}.status${endpoint.channel ? `.${endpoint.channel}` : ''}`,
+                                    data,
+                                    parseOpts,
+                                );
                             }
-                            const parseOpts = { forceIndex: true, descriptions, states };
-                            if (endpoint.channelName) {
-                                parseOpts.channelName = endpoint.channelName;
-                            }
-                            this.json2iob.parse(
-                                `${vin}.status${endpoint.channel ? `.${endpoint.channel}` : ''}`,
-                                data,
-                                parseOpts,
-                            );
                             ready = true;
                         }
                     }
@@ -1064,6 +1348,7 @@ class Byd extends utils.Adapter {
             builder: bydapi.buildVehicleRealtimeRequest,
             isReady: bydapi.isRealtimeDataReady,
             cache: true,
+            onData: (v, data) => this.processRealtimeData(v, data),
         });
     }
 
@@ -1083,6 +1368,7 @@ class Byd extends utils.Adapter {
             pollUrl: '/control/getGpsInfoResult',
             builder: bydapi.buildGpsInfoRequest,
             isReady: bydapi.isGpsDataReady,
+            onData: (v, data) => this.processGpsData(v, data),
             // No channel - flat structure directly in status
         });
     }
@@ -1099,6 +1385,8 @@ class Byd extends utils.Adapter {
             this.config.language,
             this.deviceConfig,
             vin,
+            null,
+            this.userTypeFor(vin),
         );
 
         await this.requestClient({
@@ -1140,6 +1428,7 @@ class Byd extends utils.Adapter {
             this.config.language,
             this.deviceConfig,
             vin,
+            this.userTypeFor(vin),
         );
 
         await this.requestClient({
@@ -1157,7 +1446,16 @@ class Byd extends utils.Adapter {
                     const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
                     // Unwrap statusNow to match Realtime flat structure
                     const hvacData = data.statusNow || data;
-                    this.log.debug(`HVAC data: ${JSON.stringify(hvacData)}`);
+                    // Asleep placeholder: when all three sensors read 0/missing, clear them
+                    // instead of surfacing a fake 0 degC / 0 pm reading
+                    const sensorZero = v => v === undefined || v === null || Number(v) === 0;
+                    if (sensorZero(hvacData.tempInCar) && sensorZero(hvacData.tempOutCar) && sensorZero(hvacData.pm)) {
+                        delete hvacData.tempInCar;
+                        delete hvacData.tempOutCar;
+                        delete hvacData.pm;
+                    }
+                    bydapi.sanitizeRealtime(hvacData);
+                    this.log.debug(`HVAC data: ${JSON.stringify(bydapi.redactForLog(hvacData))}`);
                     // Flat structure - directly into status
                     this.json2iob.parse(`${vin}.status`, hvacData, {
                         forceIndex: true,
@@ -1167,6 +1465,9 @@ class Byd extends utils.Adapter {
                 } else if (bydapi.isSessionExpired(decoded.code)) {
                     await this.handleSessionExpired(decoded.code, 'hvac');
                 } else if (bydapi.isEndpointNotSupported(decoded.code)) {
+                    // 1001 here is ambiguous (genuinely unsupported vs guest/userType).
+                    // The guest decision is made by the always-present realtime/GPS
+                    // endpoints; a later guest flip clears this mark so HVAC retries.
                     this.log.info(`HVAC endpoint not supported for ${vin}`);
                     if (!this.unsupportedEndpoints[vin]) {
                         this.unsupportedEndpoints[vin] = new Set();
@@ -1310,7 +1611,7 @@ class Byd extends utils.Adapter {
                 }
 
                 const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
-                this.log.debug(`EMQ broker data: ${JSON.stringify(data)}`);
+                this.log.debug(`EMQ broker data: ${JSON.stringify(bydapi.redactForLog(data))}`);
                 // Response contains emqBorker (typo in API) or emqBroker
                 this.mqttBroker = data.emqBorker || data.emqBroker;
                 this.log.debug(`MQTT broker: ${this.mqttBroker}`);
@@ -1332,6 +1633,9 @@ class Byd extends utils.Adapter {
 
         this.log.info(`Connecting to MQTT broker: ${this.mqttBroker}`);
 
+        // New client: the decrypt key must be re-confirmed against a fresh payload
+        this.mqttKeyConfirmed = false;
+
         // Connect to MQTT broker
         this.mqttClient = mqtt.connect(`mqtts://${this.mqttBroker}`, {
             clientId,
@@ -1344,8 +1648,16 @@ class Byd extends utils.Adapter {
         });
 
         this.mqttClient.on('connect', () => {
+            const client = this.mqttClient;
+            if (!client) {
+                return;
+            }
             this.log.info('MQTT connected');
-            this.mqttClient.subscribe(topic, { qos: 1 }, err => {
+            // A real CONNACK success proves the credentials were accepted
+            this.mqttConnackRefusals = 0;
+            this.mqttRecoveryAttempts = 0;
+            this.mqttRecoveryLastAt = 0;
+            client.subscribe(topic, { qos: 1 }, err => {
                 if (err) {
                     this.log.error(`MQTT subscribe error: ${err.message}`);
                 } else {
@@ -1360,6 +1672,16 @@ class Byd extends utils.Adapter {
 
         this.mqttClient.on('error', err => {
             this.log.error(`MQTT error: ${err.message}`);
+            // MQTT5 reason code >= 0x80, or 3.1.1 return codes 1-5, mean the broker
+            // refused the CONNECT. Escalate to a re-login after repeated refusals.
+            const anyErr = Object(err);
+            const code = typeof anyErr.code === 'number' ? anyErr.code : null;
+            const refused =
+                (code !== null && (code >= 128 || (code >= 1 && code <= 5))) ||
+                /not authoriz|bad user|bad username|password|refus|connack/i.test(err.message || '');
+            if (refused) {
+                this.handleMqttConnackRefusal();
+            }
         });
 
         this.mqttClient.on('close', () => {
@@ -1367,11 +1689,15 @@ class Byd extends utils.Adapter {
         });
 
         this.mqttClient.on('reconnect', () => {
+            const client = this.mqttClient;
+            if (!client || !this.session) {
+                return;
+            }
             this.log.debug('MQTT reconnecting...');
             // Update password on reconnect (timestamp changes)
             const newTsSeconds = Math.floor(Date.now() / 1000);
             const newPassword = bydapi.buildMqttPassword(this.session, clientId, newTsSeconds);
-            this.mqttClient.options.password = newPassword;
+            client.options.password = newPassword;
         });
     }
 
@@ -1390,11 +1716,12 @@ class Byd extends utils.Adapter {
                 try {
                     const decrypted = bydapi.decryptMqttPayload(stripped, this.session.encryToken);
                     payload = JSON.parse(decrypted);
-                    this.log.debug(`MQTT decrypted: ${JSON.stringify(payload)}`);
+                    // Key proven good: later decrypt failures are foreign-session payloads
+                    this.mqttKeyConfirmed = true;
+                    this.mqttDecryptReauths = 0;
+                    this.log.debug(`MQTT decrypted: ${JSON.stringify(bydapi.redactForLog(payload))}`);
                 } catch (decryptError) {
-                    // Decrypt failure often means stale encryToken - trigger re-auth (pyBYD pattern)
-                    this.log.warn(`MQTT decrypt failed (${decryptError.message}), triggering re-auth`);
-                    this.handleSessionExpired('decrypt_error', 'MQTT');
+                    this.handleMqttDecryptFailure(decryptError);
                     return;
                 }
             } else {
@@ -1413,7 +1740,7 @@ class Byd extends utils.Adapter {
             const vin = payload.vin;
 
             if (!vin) {
-                this.log.debug(`MQTT message without VIN: ${JSON.stringify(payload)}`);
+                this.log.debug(`MQTT message without VIN: ${JSON.stringify(bydapi.redactForLog(payload))}`);
                 return;
             }
 
@@ -1648,10 +1975,9 @@ class Byd extends utils.Adapter {
                 data: { request: bydapi.encodeEnvelope(req.outer) },
             });
 
-            this.log.debug(`Verify control password response: ${JSON.stringify(res.data)}`);
-            this.log.debug(`contentKey: ${req.contentKey}, encryToken: ${this.session.encryToken}`);
+            this.log.debug(`Verify control password response: ${JSON.stringify(bydapi.redactForLog(res.data))}`);
             const decoded = bydapi.decodeEnvelope(res.data);
-            this.log.debug(`Verify control password decoded: ${JSON.stringify(decoded)}`);
+            this.log.debug(`Verify control password decoded: ${JSON.stringify(bydapi.redactForLog(decoded))}`);
 
             if (decoded.code !== '0') {
                 if (bydapi.isNoPinSetError(decoded.code)) {
@@ -1674,7 +2000,9 @@ class Byd extends utils.Adapter {
             if (decoded.respondData) {
                 try {
                     const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
-                    this.log.debug(`Control password verification result: ${JSON.stringify(data)}`);
+                    this.log.debug(
+                        `Control password verification result: ${JSON.stringify(bydapi.redactForLog(data))}`,
+                    );
                     if (data.ok === true) {
                         this.log.info('Control password verified successfully');
                         return { success: true };
@@ -1727,18 +2055,82 @@ class Byd extends utils.Adapter {
 
             // this.log.debug(`Smart charging toggle response: ${JSON.stringify(res.data)}`);
             const decoded = bydapi.decodeEnvelope(res.data);
-            this.log.debug(`Decoded smart charging toggle: ${JSON.stringify(decoded)}`);
+            this.log.debug(`Decoded smart charging toggle: ${JSON.stringify(bydapi.redactForLog(decoded))}`);
             if (decoded.code !== '0') {
                 this.log.error(`Smart charging toggle failed: code=${decoded.code}`);
                 return { success: false, error: `API error: ${decoded.code}` };
             }
 
-            this.log.info(`Smart charging ${enable ? 'enabled' : 'disabled'} successfully`);
-            return { success: true };
+            // code=0 only means the request was accepted. Correlate via requestSerial and
+            // poll changeResult until the cloud confirms the switch settled (res == 2).
+            let requestSerial = null;
+            if (decoded.respondData) {
+                try {
+                    const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
+                    requestSerial = data.requestSerial || null;
+                } catch {
+                    // No/invalid respondData - treat accept as the best signal we have
+                }
+            }
+            if (!requestSerial) {
+                this.log.info(`Smart charging ${enable ? 'enable' : 'disable'} accepted (no serial to confirm)`);
+                return { success: true, pending: true };
+            }
+            return this.pollSmartChargeResult(vin, requestSerial, enable);
         } catch (error) {
             this.log.error(`Smart charging toggle error: ${error.message}`);
             return { success: false, error: error.message };
         }
+    }
+
+    /**
+     * Poll /control/smartCharge/changeResult until the toggle settles.
+     * res: 1 = pending, 2 = success (terminal), other = failure.
+     *
+     * @param {string} vin - Vehicle VIN
+     * @param {string} requestSerial - Serial from the toggle trigger
+     * @param {boolean} enable - Requested target state (for logging)
+     */
+    async pollSmartChargeResult(vin, requestSerial, enable) {
+        for (let attempt = 0; attempt < 10; attempt++) {
+            await this.sleep(1500);
+            const req = bydapi.buildSmartChargeResultRequest(
+                this.session,
+                this.config.countryCode,
+                this.config.language,
+                this.deviceConfig,
+                vin,
+                requestSerial,
+            );
+            try {
+                const res = await this.requestClient({
+                    method: 'post',
+                    url: `${bydapi.BASE_URL}/control/smartCharge/changeResult`,
+                    headers: {
+                        'User-Agent': bydapi.USER_AGENT,
+                        'Content-Type': 'application/json; charset=UTF-8',
+                    },
+                    data: { request: bydapi.encodeEnvelope(req.outer) },
+                });
+                const decoded = bydapi.decodeEnvelope(res.data);
+                if (decoded.code === '0' && decoded.respondData) {
+                    const data = bydapi.decryptResponseData(decoded.respondData, req.contentKey);
+                    const resCode = Number(data.res);
+                    if (resCode === 2) {
+                        this.log.info(`Smart charging ${enable ? 'enabled' : 'disabled'} confirmed`);
+                        return { success: true };
+                    }
+                    if (resCode !== 1 && !Number.isNaN(resCode)) {
+                        this.log.error(`Smart charging change failed (res=${resCode}): ${data.message || ''}`);
+                        return { success: false, error: `res=${resCode}` };
+                    }
+                }
+            } catch (error) {
+                this.log.debug(`Smart charge result poll attempt ${attempt + 1} error: ${error.message}`);
+            }
+        }
+        this.log.warn('Smart charging change not confirmed after poll timeout');
+        return { success: false, error: 'Polling timeout' };
     }
 
     /**
@@ -1782,7 +2174,7 @@ class Byd extends utils.Adapter {
 
             //  this.log.debug(`Charging schedule save response: ${JSON.stringify(res.data)}`);
             const decoded = bydapi.decodeEnvelope(res.data);
-            this.log.debug(`Decoded charging schedule save: ${JSON.stringify(decoded)}`);
+            this.log.debug(`Decoded charging schedule save: ${JSON.stringify(bydapi.redactForLog(decoded))}`);
             if (decoded.code !== '0') {
                 this.log.error(`Charging schedule save failed: code=${decoded.code}`);
                 return { success: false, error: `API error: ${decoded.code}` };
@@ -1817,6 +2209,11 @@ class Byd extends utils.Adapter {
         const MAX_RATE_LIMIT_RETRIES = 3;
         const RATE_LIMIT_DELAY_MS = 5000;
 
+        // Battery heat uses a dedicated endpoint pair (/control/remoteControlBatteryHeat
+        // + ...Result); the result poll must re-send controlParamsMap + commandPwd.
+        const isBatteryHeat = commandType === 'BATTERYHEAT';
+        const triggerUrl = isBatteryHeat ? '/control/remoteControlBatteryHeat' : '/control/remoteControl';
+
         // Step 1: Trigger remote control via HTTP
         const triggerReq = bydapi.buildRemoteControlRequest(
             this.session,
@@ -1827,6 +2224,8 @@ class Byd extends utils.Adapter {
             commandType,
             controlParamsMap,
             this.config.controlPin || null,
+            null,
+            this.userTypeFor(vin),
         );
 
         let requestSerial = null;
@@ -1835,7 +2234,7 @@ class Byd extends utils.Adapter {
         try {
             const res = await this.requestClient({
                 method: 'post',
-                url: `${bydapi.BASE_URL}/control/remoteControl`,
+                url: `${bydapi.BASE_URL}${triggerUrl}`,
                 headers: {
                     'User-Agent': bydapi.USER_AGENT,
                     'Content-Type': 'application/json; charset=UTF-8',
@@ -1863,6 +2262,14 @@ class Byd extends utils.Adapter {
                     return { success: false, error: 'Rate limit exceeded' };
                 }
 
+                // userType mismatch (guest/owner): flip the flag and retry once immediately
+                if (this.flipGuestIfWrongUserType(vin, decoded.code, 'Remote control')) {
+                    if (retryCount < 1) {
+                        return this.sendRemoteControl(vin, commandType, controlParamsMap, retryCount + 1);
+                    }
+                    return { success: false, error: `userType mismatch (code=${decoded.code})` };
+                }
+
                 if (bydapi.isSessionExpired(decoded.code)) {
                     this.log.warn('Session expired, re-authenticating...');
                     this.log.debug(`DEBUG: Setting session=null in sendRemoteControl (code=${decoded.code})`);
@@ -1882,7 +2289,7 @@ class Byd extends utils.Adapter {
                 triggerError = `API error: ${decoded.code}`;
             } else if (decoded.respondData) {
                 const data = bydapi.decryptResponseData(decoded.respondData, triggerReq.contentKey);
-                this.log.debug(`Remote control trigger data: ${JSON.stringify(data)}`);
+                this.log.debug(`Remote control trigger data: ${JSON.stringify(bydapi.redactForLog(data))}`);
                 requestSerial = data.requestSerial || null;
                 this.log.debug(`Remote control triggered, requestSerial: ${requestSerial}`);
             }
@@ -1913,7 +2320,14 @@ class Byd extends utils.Adapter {
 
         // Step 3: MQTT timeout - fall back to HTTP polling
         this.log.debug('MQTT timeout, falling back to HTTP polling...');
-        return this.pollRemoteControlResult(vin, commandType, requestSerial, triggerReq.contentKey);
+        return this.pollRemoteControlResult(
+            vin,
+            commandType,
+            requestSerial,
+            triggerReq.contentKey,
+            isBatteryHeat ? controlParamsMap : null,
+            isBatteryHeat ? this.config.controlPin || null : null,
+        );
     }
 
     /**
@@ -1923,10 +2337,21 @@ class Byd extends utils.Adapter {
      * @param {string} commandType - Command type
      * @param {string} requestSerial - Request serial from trigger
      * @param {string} contentKey - Content key for decryption
+     * @param {object|null} controlParamsMap - Re-sent on the battery-heat result poll
+     * @param {string|null} commandPwd - Re-sent on the battery-heat result poll
      */
-    async pollRemoteControlResult(vin, commandType, requestSerial, contentKey) {
+    async pollRemoteControlResult(
+        vin,
+        commandType,
+        requestSerial,
+        contentKey,
+        controlParamsMap = null,
+        commandPwd = null,
+    ) {
         const MAX_POLL_ATTEMPTS = 10;
         const POLL_INTERVAL_MS = 1500;
+        const isBatteryHeat = commandType === 'BATTERYHEAT';
+        const pollUrl = isBatteryHeat ? '/control/remoteControlBatteryHeatResult' : '/control/remoteControlResult';
 
         for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
             await this.sleep(POLL_INTERVAL_MS);
@@ -1938,15 +2363,16 @@ class Byd extends utils.Adapter {
                 this.deviceConfig,
                 vin,
                 commandType,
-                null,
-                null,
+                controlParamsMap,
+                commandPwd,
                 requestSerial,
+                this.userTypeFor(vin),
             );
 
             try {
                 const res = await this.requestClient({
                     method: 'post',
-                    url: `${bydapi.BASE_URL}/control/remoteControlResult`,
+                    url: `${bydapi.BASE_URL}${pollUrl}`,
                     headers: {
                         'User-Agent': bydapi.USER_AGENT,
                         'Content-Type': 'application/json; charset=UTF-8',

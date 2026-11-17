@@ -100,6 +100,29 @@
             "newLine": true,
             "sm": 3
         },
+        "identifierType": {
+            "type": "select",
+            "label": {
+                "en": "Login identifier type",
+                "de": "Login-Kennungstyp",
+                "ru": "Тип идентификатора входа",
+                "pt": "Tipo de identificador de login",
+                "nl": "Type login-identificatie",
+                "fr": "Type d'identifiant de connexion",
+                "it": "Tipo di identificatore di accesso",
+                "es": "Tipo de identificador de inicio de sesión",
+                "pl": "Typ identyfikatora logowania",
+                "uk": "Тип ідентифікатора входу",
+                "zh-cn": "登录标识符类型"
+            },
+            "options": [
+                { "label": "Email", "value": "0" },
+                { "label": "Phone", "value": "1" }
+            ],
+            "default": "0",
+            "newLine": true,
+            "sm": 3
+        },
         "_pollHeader": {
             "type": "header",
             "text": {
